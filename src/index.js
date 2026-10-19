@@ -1,4 +1,4 @@
-// Autoposter Bot - Step 2: saving Source / Lectures / PDFs channels
+// Autoposter Bot - Step 3: auto-posting files from Source channels
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -66,6 +66,61 @@ async function getState(env, userId) {
 
 async function clearState(env, userId) {
   await env.DB.prepare("DELETE FROM state WHERE user_id = ?").bind(String(userId)).run();
+}
+
+// ---------- Files we have seen in source channels ----------
+async function saveFile(env, f) {
+  // Returns the new row id, or null if we already saw this exact file
+  const r = await env.DB.prepare(
+    "INSERT OR IGNORE INTO files (file_id, file_unique_id, kind, send_as, title, size) VALUES (?, ?, ?, ?, ?, ?)"
+  ).bind(f.file_id, f.file_unique_id, f.kind, f.send_as, f.title, f.size).run();
+  return r.meta.changes > 0 ? r.meta.last_row_id : null;
+}
+
+async function getFileRow(env, id) {
+  return env.DB.prepare("SELECT * FROM files WHERE id = ?").bind(id).first();
+}
+
+function formatSize(bytes) {
+  if (!bytes) return "Unknown";
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? (mb / 1024).toFixed(2) + " GB" : mb.toFixed(1) + " MB";
+}
+
+// Decides if a post is a lecture (video) or a PDF. Anything else is ignored.
+function classifyPost(post) {
+  if (post.video) {
+    return { kind: "lecture", send_as: "video", file: post.video, name: post.video.file_name || "" };
+  }
+  if (post.document) {
+    const d = post.document;
+    const name = d.file_name || "";
+    const mime = d.mime_type || "";
+    if (mime === "application/pdf" || /\.pdf$/i.test(name)) {
+      return { kind: "pdf", send_as: "document", file: d, name };
+    }
+    if (mime.startsWith("video/")) {
+      return { kind: "lecture", send_as: "document", file: d, name };
+    }
+  }
+  return null;
+}
+
+// Title = first line of the caption, otherwise the file name without extension
+function makeTitle(post, name) {
+  const caption = (post.caption || "").split("\n")[0].trim();
+  if (caption) return caption;
+  const cleaned = name.replace(/\.[^.]+$/, "").replace(/[._]+/g, " ").trim();
+  return cleaned || "Untitled";
+}
+
+async function sendFileToUser(env, chatId, row) {
+  const asVideo = row.send_as === "video";
+  await tg(env, asVideo ? "sendVideo" : "sendDocument", {
+    chat_id: chatId,
+    [asVideo ? "video" : "document"]: row.file_id,
+    caption: row.title,
+  });
 }
 
 // ---------- Menus ----------
@@ -168,6 +223,17 @@ async function handleMessage(msg, env) {
   const isOwner = userId === String(env.OWNER_ID);
 
   if (text.startsWith("/start")) {
+    // Links from channel posts look like /start f12
+    const match = text.match(/^\/start f(\d+)/);
+    if (match) {
+      const row = await getFileRow(env, Number(match[1]));
+      if (!row) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
+      } else {
+        await sendFileToUser(env, chatId, row);
+      }
+      return;
+    }
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: "👋 Hi! I'm your Autoposter bot.\nOwner can use /settings to configure me.",
@@ -297,6 +363,50 @@ async function handleButton(query, env) {
   }
 }
 
+// ---------- Handling new posts in channels ----------
+async function handleChannelPost(post, env) {
+  // Only react to channels saved as Source Channels
+  const chatId = String(post.chat.id);
+  const isSource = await env.DB.prepare(
+    "SELECT 1 AS ok FROM channels WHERE role = 'source' AND chat_id = ?"
+  ).bind(chatId).first();
+  if (!isSource) return;
+
+  const info = classifyPost(post);
+  if (!info) return;
+
+  // Find where to publish it
+  const destRole = info.kind === "pdf" ? "pdfs" : "lectures";
+  const dest = await getChannels(env, destRole);
+  if (!dest.length) return;
+
+  const title = makeTitle(post, info.name);
+  const rowId = await saveFile(env, {
+    file_id: info.file.file_id,
+    file_unique_id: info.file.file_unique_id,
+    kind: info.kind,
+    send_as: info.send_as,
+    title,
+    size: info.file.file_size || 0,
+  });
+  if (!rowId) return; // already posted before
+
+  const me = await tg(env, "getMe", {});
+  const emoji = info.kind === "pdf" ? "📄" : "🎓";
+  const label = info.kind === "pdf" ? "PDF" : "Lecture";
+
+  await tg(env, "sendMessage", {
+    chat_id: dest[0].chat_id,
+    text: `${emoji} <b>${esc(title)}</b>\n\n🏷 Type: ${label}\n📦 Size: ${formatSize(info.file.file_size)}`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "📥 Get File", url: `https://t.me/${me.result.username}?start=f${rowId}` },
+      ]],
+    },
+  });
+}
+
 // ---------- Entry point ----------
 export default {
   async fetch(request, env) {
@@ -312,6 +422,7 @@ export default {
     try {
       if (update.message) await handleMessage(update.message, env);
       if (update.callback_query) await handleButton(update.callback_query, env);
+      if (update.channel_post) await handleChannelPost(update.channel_post, env);
     } catch (err) {
       console.log("Error:", err);
     }
