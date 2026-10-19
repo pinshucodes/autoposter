@@ -1,4 +1,4 @@
-// Autoposter Bot - Step 3: auto-posting files from Source channels
+// Autoposter Bot - Step 4: ForceSub (users must join channels to get files)
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -31,22 +31,26 @@ const ROLES = {
     emoji: "📄", name: "PDFs Channel", multi: false,
     help: "The channel where PDF posts will be published.",
   },
+  forcesub: {
+    emoji: "🔐", name: "ForceSub Channels", multi: true,
+    help: "Users must join all of these before they can get a file. Make me an admin in each one (with Invite Users permission for private channels). No channels = ForceSub is off.",
+  },
 };
 
 // ---------- Database helpers ----------
 async function getChannels(env, role) {
-  const r = await env.DB.prepare("SELECT chat_id, title FROM channels WHERE role = ?").bind(role).all();
+  const r = await env.DB.prepare("SELECT chat_id, title, link FROM channels WHERE role = ?").bind(role).all();
   return r.results || [];
 }
 
-async function addChannel(env, role, chatId, title) {
+async function addChannel(env, role, chatId, title, link) {
   const steps = [];
   if (!ROLES[role].multi) {
     steps.push(env.DB.prepare("DELETE FROM channels WHERE role = ?").bind(role));
   }
   steps.push(
-    env.DB.prepare("INSERT OR REPLACE INTO channels (role, chat_id, title) VALUES (?, ?, ?)")
-      .bind(role, String(chatId), title)
+    env.DB.prepare("INSERT OR REPLACE INTO channels (role, chat_id, title, link) VALUES (?, ?, ?, ?)")
+      .bind(role, String(chatId), title, link || null)
   );
   await env.DB.batch(steps);
 }
@@ -123,6 +127,39 @@ async function sendFileToUser(env, chatId, row) {
   });
 }
 
+// ---------- ForceSub check ----------
+// Returns the ForceSub channels this user has NOT joined yet
+async function getMissingChannels(env, userId) {
+  const channels = await getChannels(env, "forcesub");
+  const missing = [];
+  for (const c of channels) {
+    const r = await tg(env, "getChatMember", { chat_id: c.chat_id, user_id: userId });
+    if (!r.ok) continue; // can't check (e.g. I lost admin) - don't block the user
+    const st = r.result.status;
+    const joined = st === "member" || st === "administrator" || st === "creator" ||
+      (st === "restricted" && r.result.is_member);
+    if (!joined) missing.push(c);
+  }
+  return missing;
+}
+
+// Sends the file, or asks the user to join the channels first
+async function deliverFile(env, chatId, userId, row) {
+  const missing = await getMissingChannels(env, userId);
+  if (!missing.length) {
+    await sendFileToUser(env, chatId, row);
+    return;
+  }
+  const buttons = missing.map((c) => [{ text: `📢 Join ${c.title}`.slice(0, 60), url: c.link }]);
+  buttons.push([{ text: "✅ I've Joined", callback_data: `chk:${row.id}` }]);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "🔐 To get this file, please join the channel(s) below, then tap <b>I've Joined</b>.",
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
 // ---------- Menus ----------
 const MAIN_MENU = {
   text: "⚙️ <b>Settings</b>\n\nSelect what you want to configure:",
@@ -130,7 +167,7 @@ const MAIN_MENU = {
     [{ text: "📥 Source Channels", callback_data: "role:source" }],
     [{ text: "🎓 Lectures Channel", callback_data: "role:lectures" }],
     [{ text: "📄 PDFs Channel", callback_data: "role:pdfs" }],
-    [{ text: "🔐 ForceSub Settings", callback_data: "forcesub" }],
+    [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
     [{ text: "🔗 Shortlink Settings", callback_data: "shortlink" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "delete" }],
     [{ text: "❌ Close", callback_data: "close" }],
@@ -139,7 +176,6 @@ const MAIN_MENU = {
 
 // Placeholders for settings we build in later steps
 const SUB_MENUS = {
-  forcesub: "🔐 <b>ForceSub Settings</b>\n\nComing in a later step.",
   shortlink: "🔗 <b>Shortlink Settings</b>\n\nComing in a later step.",
   delete: "🗑️ <b>File Delete Settings</b>\n\nComing in a later step.",
 };
@@ -209,8 +245,20 @@ async function checkChannel(env, ref, role) {
   if (!member.ok || member.result.status !== "administrator") {
     return { error: "Please add me as an <b>admin</b> in that channel first, then send it again." };
   }
-  if (role !== "source" && member.result.can_post_messages === false) {
+  if ((role === "lectures" || role === "pdfs") && member.result.can_post_messages === false) {
     return { error: "I'm an admin there, but I need the <b>Post Messages</b> permission. Turn it on and send again." };
+  }
+  // ForceSub channels need a join link for the buttons
+  if (role === "forcesub") {
+    let link = chat.result.username ? `https://t.me/${chat.result.username}` : null;
+    if (!link) {
+      const inv = await tg(env, "exportChatInviteLink", { chat_id: chat.result.id });
+      if (inv.ok) link = inv.result;
+    }
+    if (!link) {
+      return { error: "I couldn't get a join link. Give me the <b>Invite Users via Link</b> permission in that channel and send again." };
+    }
+    return { id: chat.result.id, title: chat.result.title, link };
   }
   return { id: chat.result.id, title: chat.result.title };
 }
@@ -230,7 +278,7 @@ async function handleMessage(msg, env) {
       if (!row) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
       } else {
-        await sendFileToUser(env, chatId, row);
+        await deliverFile(env, chatId, msg.from.id, row);
       }
       return;
     }
@@ -278,7 +326,7 @@ async function handleMessage(msg, env) {
       await tg(env, "sendMessage", { chat_id: chatId, text: "⚠️ " + result.error, parse_mode: "HTML" });
       return;
     }
-    await addChannel(env, role, result.id, result.title);
+    await addChannel(env, role, result.id, result.title, result.link);
     await clearState(env, userId);
     await tg(env, "sendMessage", {
       chat_id: chatId,
@@ -298,6 +346,28 @@ async function handleButton(query, env) {
   const userId = String(query.from.id);
   const parts = query.data.split(":");
   const action = parts[0];
+
+  // "I've Joined" button - anyone can use this one
+  if (action === "chk") {
+    const row = await getFileRow(env, Number(parts[1]));
+    if (!row) {
+      await tg(env, "answerCallbackQuery", {
+        callback_query_id: query.id, text: "That file is no longer available.", show_alert: true,
+      });
+      return;
+    }
+    const missing = await getMissingChannels(env, query.from.id);
+    if (missing.length) {
+      await tg(env, "answerCallbackQuery", {
+        callback_query_id: query.id, text: "You haven't joined all the channels yet.", show_alert: true,
+      });
+      return;
+    }
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+    await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
+    await sendFileToUser(env, chatId, row);
+    return;
+  }
 
   if (userId !== String(env.OWNER_ID)) {
     await tg(env, "answerCallbackQuery", {
