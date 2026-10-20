@@ -1,4 +1,4 @@
-// Autoposter Bot - Step 4: ForceSub (users must join channels to get files)
+// Autoposter Bot - Step 5: Shortlink (users pass a shortlink before getting files)
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -127,6 +127,63 @@ async function sendFileToUser(env, chatId, row) {
   });
 }
 
+// ---------- Simple saved settings ----------
+async function getSetting(env, key) {
+  const r = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+  return r ? r.value : null;
+}
+
+async function setSetting(env, key, value) {
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(key, value).run();
+}
+
+// ---------- Shortlink ----------
+async function shortlinkReady(env) {
+  const on = await getSetting(env, "shortlink_enabled");
+  const domain = await getSetting(env, "shortlink_domain");
+  const key = await getSetting(env, "shortlink_key");
+  return on === "1" && !!domain && !!key;
+}
+
+// Works with most shortener sites that use the standard /api?api=KEY&url=LINK format
+async function shortenUrl(env, longUrl) {
+  const domain = await getSetting(env, "shortlink_domain");
+  const key = await getSetting(env, "shortlink_key");
+  if (!domain || !key) return null;
+  try {
+    const api = `https://${domain}/api?api=${encodeURIComponent(key)}&url=${encodeURIComponent(longUrl)}`;
+    const res = await fetch(api);
+    const data = await res.json();
+    if (data.status === "success" && data.shortenedUrl) return data.shortenedUrl;
+    console.log("Shortlink API said:", JSON.stringify(data));
+  } catch (err) {
+    console.log("Shortlink error:", err);
+  }
+  return null;
+}
+
+// Gives the user a one-time shortlink. After passing it, they come back to the bot with a token.
+async function sendVerifyLink(env, chatId, userId, row) {
+  const token = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  await env.DB.prepare("DELETE FROM tokens WHERE created < ?").bind(Date.now() - 24 * 3600 * 1000).run();
+  await env.DB.prepare("INSERT INTO tokens (token, user_id, file_row_id, created) VALUES (?, ?, ?, ?)")
+    .bind(token, String(userId), row.id, Date.now()).run();
+
+  const me = await tg(env, "getMe", {});
+  const short = await shortenUrl(env, `https://t.me/${me.result.username}?start=v${token}`);
+  if (!short) {
+    // Shortener is down or misconfigured - don't leave the user stuck
+    await sendFileToUser(env, chatId, row);
+    return;
+  }
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `🔗 <b>Verify to get your file</b>\n\n<b>${esc(row.title)}</b>\n\nTap the button below and complete the short step. You'll be brought back here and I'll send the file.`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{ text: "✅ Verify & Get File", url: short }]] },
+  });
+}
+
 // ---------- ForceSub check ----------
 // Returns the ForceSub channels this user has NOT joined yet
 async function getMissingChannels(env, userId) {
@@ -144,9 +201,13 @@ async function getMissingChannels(env, userId) {
 }
 
 // Sends the file, or asks the user to join the channels first
-async function deliverFile(env, chatId, userId, row) {
+async function deliverFile(env, chatId, userId, row, verified) {
   const missing = await getMissingChannels(env, userId);
   if (!missing.length) {
+    if (!verified && (await shortlinkReady(env))) {
+      await sendVerifyLink(env, chatId, userId, row);
+      return;
+    }
     await sendFileToUser(env, chatId, row);
     return;
   }
@@ -168,7 +229,7 @@ const MAIN_MENU = {
     [{ text: "🎓 Lectures Channel", callback_data: "role:lectures" }],
     [{ text: "📄 PDFs Channel", callback_data: "role:pdfs" }],
     [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
-    [{ text: "🔗 Shortlink Settings", callback_data: "shortlink" }],
+    [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "delete" }],
     [{ text: "❌ Close", callback_data: "close" }],
   ],
@@ -176,7 +237,6 @@ const MAIN_MENU = {
 
 // Placeholders for settings we build in later steps
 const SUB_MENUS = {
-  shortlink: "🔗 <b>Shortlink Settings</b>\n\nComing in a later step.",
   delete: "🗑️ <b>File Delete Settings</b>\n\nComing in a later step.",
 };
 
@@ -219,6 +279,73 @@ async function showMainMenu(env, chatId, messageId) {
     text: MAIN_MENU.text,
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: MAIN_MENU.buttons },
+  });
+}
+
+// ---------- Shortlink settings menu ----------
+async function buildShortlinkMenu(env, note) {
+  const domain = await getSetting(env, "shortlink_domain");
+  const key = await getSetting(env, "shortlink_key");
+  const on = (await getSetting(env, "shortlink_enabled")) === "1";
+
+  let text = "🔗 <b>Shortlink Settings</b>\n\nUsers pass a shortlink before they get a file.\n\n";
+  text += `Status: ${on ? "✅ ON" : "❌ OFF"}\n`;
+  text += `Domain: ${domain ? esc(domain) : "<i>not set</i>"}\n`;
+  text += `API key: ${key ? "<code>" + esc(key.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}`;
+  if (note) text += `\n\n${note}`;
+
+  const buttons = [
+    [{ text: on ? "🔴 Turn OFF" : "🟢 Turn ON", callback_data: "sl:toggle" }],
+    [{ text: "🌐 Set Domain", callback_data: "sl:domain" }],
+    [{ text: "🔑 Set API Key", callback_data: "sl:key" }],
+    ...BACK_BUTTON,
+  ];
+  return { text, buttons };
+}
+
+async function showShortlinkMenu(env, chatId, messageId, note) {
+  const menu = await buildShortlinkMenu(env, note);
+  await tg(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: menu.text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: menu.buttons },
+  });
+}
+
+// Owner typed a new domain or API key
+async function handleSettingInput(env, msg, field) {
+  const chatId = msg.chat.id;
+  const userId = String(msg.from.id);
+  let value = (msg.text || "").trim();
+  if (!value) {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "Please send it as text, or /cancel to stop." });
+    return;
+  }
+  if (field === "shortlink_domain") {
+    value = value.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
+  }
+  if (field === "shortlink_key") {
+    // Remove the owner's message so the key doesn't stay in the chat
+    await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+  }
+  await setSetting(env, field, value);
+  await clearState(env, userId);
+
+  let note = "✅ Saved.";
+  const domain = await getSetting(env, "shortlink_domain");
+  const key = await getSetting(env, "shortlink_key");
+  if (domain && key) {
+    const test = await shortenUrl(env, "https://t.me/telegram");
+    note += test ? " Test shortlink worked ✅" : " ⚠️ Test failed. Double-check your domain and API key.";
+  }
+  const menu = await buildShortlinkMenu(env, note);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: menu.text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: menu.buttons },
   });
 }
 
@@ -271,6 +398,30 @@ async function handleMessage(msg, env) {
   const isOwner = userId === String(env.OWNER_ID);
 
   if (text.startsWith("/start")) {
+    // Coming back from the shortlink: /start v<token>
+    const tok = text.match(/^\/start v([A-Za-z0-9]+)/);
+    if (tok) {
+      const t = await env.DB.prepare("SELECT file_row_id, user_id, created FROM tokens WHERE token = ?")
+        .bind(tok[1]).first();
+      const fresh = t && Date.now() - t.created < 60 * 60 * 1000;
+      if (!t || String(t.user_id) !== userId || !fresh) {
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: "⚠️ This verification link is invalid or has expired. Please tap <b>Get File</b> on the channel post again.",
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      await env.DB.prepare("DELETE FROM tokens WHERE token = ?").bind(tok[1]).run();
+      const row = await getFileRow(env, t.file_row_id);
+      if (!row) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
+      } else {
+        await deliverFile(env, chatId, msg.from.id, row, true);
+      }
+      return;
+    }
+
     // Links from channel posts look like /start f12
     const match = text.match(/^\/start f(\d+)/);
     if (match) {
@@ -311,6 +462,10 @@ async function handleMessage(msg, env) {
 
   // Are we waiting for the owner to send a channel?
   const state = await getState(env, userId);
+  if (state && state.startsWith("set:")) {
+    await handleSettingInput(env, msg, state.split(":")[1]);
+    return;
+  }
   if (state && state.startsWith("add:")) {
     const role = state.split(":")[1];
     const ref = extractChannelRef(msg);
@@ -365,7 +520,7 @@ async function handleButton(query, env) {
     }
     await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
-    await sendFileToUser(env, chatId, row);
+    await deliverFile(env, chatId, query.from.id, row, false);
     return;
   }
 
@@ -419,6 +574,39 @@ async function handleButton(query, env) {
   if (action === "rm" && ROLES[parts[1]]) {
     await removeChannel(env, parts[1], parts.slice(2).join(":"));
     await showRoleMenu(env, chatId, messageId, parts[1]);
+    return;
+  }
+
+  // Shortlink settings: sl:menu, sl:toggle, sl:domain, sl:key
+  if (action === "sl") {
+    const sub = parts[1];
+    if (sub === "domain" || sub === "key") {
+      await setState(env, userId, `set:shortlink_${sub}`);
+      const prompt = sub === "domain"
+        ? "🌐 Send your shortener's domain, like <code>example.com</code>."
+        : "🔑 Send your shortener's API key. I'll delete your message after saving it.";
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: prompt,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "sl:menu" }]] },
+      });
+      return;
+    }
+    let note = "";
+    if (sub === "toggle") {
+      const on = (await getSetting(env, "shortlink_enabled")) === "1";
+      if (on) {
+        await setSetting(env, "shortlink_enabled", "0");
+      } else if (!(await getSetting(env, "shortlink_domain")) || !(await getSetting(env, "shortlink_key"))) {
+        note = "⚠️ Set the domain and API key first.";
+      } else {
+        await setSetting(env, "shortlink_enabled", "1");
+      }
+    }
+    await clearState(env, userId);
+    await showShortlinkMenu(env, chatId, messageId, note);
     return;
   }
 
