@@ -1,4 +1,4 @@
-// Autoposter Bot - Step 6: File auto-delete (sent files are removed after a delay)
+// Autoposter Bot - Step 8: /post, /broadcast, /stats
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -145,10 +145,10 @@ async function sendFileToUser(env, chatId, row) {
 }
 
 // Runs every minute (Cron Trigger): deletes messages whose time is up
-async function runDeletions(env) {
+async function runDeletions(env, limit) {
   const due = await env.DB.prepare(
-    "SELECT id, chat_id, message_id FROM deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT 40"
-  ).bind(Date.now()).all();
+    "SELECT id, chat_id, message_id FROM deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT ?"
+  ).bind(Date.now(), limit).all();
   for (const d of due.results || []) {
     await tg(env, "deleteMessage", { chat_id: d.chat_id, message_id: d.message_id });
     await env.DB.prepare("DELETE FROM deletions WHERE id = ?").bind(d.id).run();
@@ -259,6 +259,7 @@ const MAIN_MENU = {
     [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
     [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "del:menu" }],
+    [{ text: "🖼️ Cover Images", callback_data: "cov:menu" }],
     [{ text: "❌ Close", callback_data: "close" }],
   ],
 };
@@ -306,6 +307,37 @@ async function showMainMenu(env, chatId, messageId) {
     text: MAIN_MENU.text,
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: MAIN_MENU.buttons },
+  });
+}
+
+// ---------- Cover images menu ----------
+async function buildCoverMenu(env, note) {
+  const pdf = await getSetting(env, "cover_pdf");
+  const lec = await getSetting(env, "cover_lecture");
+  let text = "🖼️ <b>Cover Images</b>\n\n" +
+    "A cover is the picture shown on each channel post. If none is set, I use the file's own thumbnail when it has one.\n\n" +
+    `📄 PDF cover: ${pdf ? "✅ Set" : "❌ Not set"}\n` +
+    `🎓 Lecture cover: ${lec ? "✅ Set" : "❌ Not set"}`;
+  if (note) text += `\n\n${note}`;
+
+  const buttons = [
+    [{ text: pdf ? "📄 Change PDF Cover" : "📄 Set PDF Cover", callback_data: "cov:set:pdf" }],
+    [{ text: lec ? "🎓 Change Lecture Cover" : "🎓 Set Lecture Cover", callback_data: "cov:set:lecture" }],
+  ];
+  if (pdf) buttons.push([{ text: "🗑 Remove PDF Cover", callback_data: "cov:rm:pdf" }]);
+  if (lec) buttons.push([{ text: "🗑 Remove Lecture Cover", callback_data: "cov:rm:lecture" }]);
+  buttons.push(...BACK_BUTTON);
+  return { text, buttons };
+}
+
+async function showCoverMenu(env, chatId, messageId, note) {
+  const menu = await buildCoverMenu(env, note);
+  await tg(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: menu.text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: menu.buttons },
   });
 }
 
@@ -387,6 +419,26 @@ async function showShortlinkMenu(env, chatId, messageId, note) {
 async function handleSettingInput(env, msg, field) {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
+  if (field.startsWith("cover_")) {
+    if (!msg.photo) {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "Please send a photo (not a file), or /cancel to stop.",
+      });
+      return;
+    }
+    await setSetting(env, field, msg.photo[msg.photo.length - 1].file_id);
+    await clearState(env, userId);
+    const cmenu = await buildCoverMenu(env, "✅ Cover saved.");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: cmenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: cmenu.buttons },
+    });
+    return;
+  }
+
   let value = (msg.text || "").trim();
   if (!value) {
     await tg(env, "sendMessage", { chat_id: chatId, text: "Please send it as text, or /cancel to stop." });
@@ -479,12 +531,157 @@ async function checkChannel(env, ref, role) {
   return { id: chat.result.id, title: chat.result.title };
 }
 
+// ---------- Users, stats, post and broadcast ----------
+// Days (for stats) follow this time zone. 330 = India (IST). Change if you like.
+const TZ_OFFSET_MIN = 330;
+
+function dayString(daysAgo) {
+  const t = Date.now() + TZ_OFFSET_MIN * 60000 - daysAgo * 86400000;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+async function recordUser(env, from) {
+  await env.DB.prepare(
+    "INSERT INTO users (user_id, first_name, joined_day, last_seen, active) VALUES (?, ?, ?, ?, 1) " +
+    "ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name, last_seen = excluded.last_seen, active = 1"
+  ).bind(String(from.id), from.first_name || "", dayString(0), Date.now()).run();
+}
+
+// /post goes to these channels (not the Source channels)
+async function getPostTargets(env) {
+  const r = await env.DB.prepare(
+    "SELECT DISTINCT chat_id, title FROM channels WHERE role IN ('lectures', 'pdfs', 'forcesub')"
+  ).all();
+  return r.results || [];
+}
+
+async function countBroadcastUsers(env) {
+  const r = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE banned = 0 AND active = 1").first();
+  return r ? r.n : 0;
+}
+
+// Shows "are you sure?" after the owner sends the message for /post or /broadcast
+async function askConfirm(env, msg, kind) {
+  const userId = String(msg.from.id);
+  await clearState(env, userId);
+
+  let question;
+  if (kind === "post") {
+    const targets = await getPostTargets(env);
+    if (!targets.length) {
+      await tg(env, "sendMessage", {
+        chat_id: msg.chat.id,
+        text: "You haven't added any Lectures, PDFs, or ForceSub channels yet. Add them in /settings first.",
+      });
+      return;
+    }
+    question = `📣 Post this message as it is to <b>${targets.length}</b> channel(s)?\n\n` +
+      targets.map((c) => `• ${esc(c.title)}`).join("\n");
+  } else {
+    question = `📢 Send this message to <b>${await countBroadcastUsers(env)}</b> users?`;
+  }
+
+  await tg(env, "sendMessage", {
+    chat_id: msg.chat.id,
+    text: question,
+    parse_mode: "HTML",
+    reply_to_message_id: msg.message_id,
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Yes, send", callback_data: `pst:${kind}:${msg.message_id}` },
+        { text: "✖️ Cancel", callback_data: "pst:no" },
+      ]],
+    },
+  });
+}
+
+// Sends the broadcast to the next batch of users. Called right away and then every minute by the cron.
+async function processBroadcast(env, limit) {
+  const job = await env.DB.prepare("SELECT * FROM broadcasts WHERE status = 'running' ORDER BY id LIMIT 1").first();
+  if (!job) return;
+
+  const users = await env.DB.prepare(
+    "SELECT rowid AS rid, user_id FROM users WHERE rowid > ? AND banned = 0 AND active = 1 ORDER BY rowid LIMIT ?"
+  ).bind(job.last_rowid, limit).all();
+  const list = users.results || [];
+
+  let sent = 0, failed = 0, last = job.last_rowid, rateLimited = false;
+  for (const u of list) {
+    const r = await tg(env, "copyMessage", {
+      chat_id: u.user_id, from_chat_id: job.from_chat, message_id: job.message_id,
+    });
+    if (!r.ok && r.error_code === 429) { rateLimited = true; break; } // Telegram says slow down; retry next minute
+    if (r.ok) {
+      sent++;
+    } else {
+      failed++;
+      if (r.error_code === 403) {
+        // The user blocked the bot - skip them in future broadcasts
+        await env.DB.prepare("UPDATE users SET active = 0 WHERE user_id = ?").bind(u.user_id).run();
+      }
+    }
+    last = u.rid;
+  }
+
+  const finished = !rateLimited && list.length < limit;
+  await env.DB.prepare(
+    "UPDATE broadcasts SET last_rowid = ?, sent = sent + ?, failed = failed + ?, status = ? WHERE id = ?"
+  ).bind(last, sent, failed, finished ? "done" : "running", job.id).run();
+
+  if (finished) {
+    await tg(env, "sendMessage", {
+      chat_id: job.owner_chat,
+      text: `✅ Broadcast finished.\nDelivered: ${job.sent + sent}\nFailed: ${job.failed + failed}`,
+    });
+  }
+}
+
+// Runs every minute. Deletions and broadcasts share Cloudflare's free request limit per run.
+async function runCron(env) {
+  const job = await env.DB.prepare("SELECT 1 AS x FROM broadcasts WHERE status = 'running' LIMIT 1").first();
+  await runDeletions(env, job ? 15 : 40);
+  if (job) await processBroadcast(env, 30);
+}
+
+async function sendStats(env, chatId) {
+  const today = dayString(0);
+  const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
+  const active = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE active = 1").first();
+  const joined = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE joined_day = ?").bind(today).first();
+  const ver = await env.DB.prepare(
+    "SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM verifications WHERE day = ?"
+  ).bind(today).first();
+  const files = await env.DB.prepare("SELECT COUNT(*) AS n FROM files").first();
+  const week = await env.DB.prepare(
+    "SELECT day, COUNT(*) AS n FROM verifications WHERE day >= ? GROUP BY day"
+  ).bind(dayString(6)).all();
+
+  const counts = {};
+  for (const r of week.results || []) counts[r.day] = r.n;
+  const lines = [];
+  for (let i = 0; i < 7; i++) {
+    const d = dayString(i);
+    lines.push(`${d}: ${counts[d] || 0}`);
+  }
+
+  const text =
+    "📊 <b>Stats</b>\n\n" +
+    `👥 Users: <b>${total.n}</b> (${active.n} active)\n` +
+    `🆕 Joined today: <b>${joined.n}</b>\n` +
+    `✅ Verifications today: <b>${ver.n}</b> (${ver.u} people)\n` +
+    `📁 Files posted: <b>${files.n}</b>\n\n` +
+    "📅 <b>Verifications, last 7 days</b>\n" + lines.join("\n") +
+    "\n\n<i>Days follow India time (IST).</i>";
+  await tg(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+}
+
 // ---------- Handling messages ----------
 async function handleMessage(msg, env) {
   const text = msg.text || "";
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
   const isOwner = userId === String(env.OWNER_ID);
+  if (msg.chat.type === "private") await recordUser(env, msg.from);
 
   if (text.startsWith("/start")) {
     // Coming back from the shortlink: /start v<token>
@@ -502,6 +699,8 @@ async function handleMessage(msg, env) {
         return;
       }
       await env.DB.prepare("DELETE FROM tokens WHERE token = ?").bind(tok[1]).run();
+      await env.DB.prepare("INSERT INTO verifications (user_id, file_row_id, day) VALUES (?, ?, ?)")
+        .bind(userId, t.file_row_id, dayString(0)).run();
       const row = await getFileRow(env, t.file_row_id);
       if (!row) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
@@ -531,6 +730,30 @@ async function handleMessage(msg, env) {
 
   if (!isOwner) return;
 
+  if (text.startsWith("/stats")) {
+    await clearState(env, userId);
+    await sendStats(env, chatId);
+    return;
+  }
+
+  if (text.startsWith("/post")) {
+    await setState(env, userId, "post");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "📣 Send the message you want to post (text, photo, video, file, anything). I'll ask you to confirm before it goes out.\n\nIt will be posted as it is to your Lectures, PDFs, and ForceSub channels.\n\n/cancel to stop.",
+    });
+    return;
+  }
+
+  if (text.startsWith("/broadcast")) {
+    await setState(env, userId, "broadcast");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "📢 Send the message you want to broadcast to all bot users (text, photo, video, file, anything). I'll ask you to confirm first.\n\n/cancel to stop.",
+    });
+    return;
+  }
+
   if (text.startsWith("/settings")) {
     await clearState(env, userId);
     await tg(env, "sendMessage", {
@@ -551,6 +774,10 @@ async function handleMessage(msg, env) {
 
   // Are we waiting for the owner to send a channel?
   const state = await getState(env, userId);
+  if (state === "post" || state === "broadcast") {
+    await askConfirm(env, msg, state);
+    return;
+  }
   if (state && state.startsWith("set:")) {
     await handleSettingInput(env, msg, state.split(":")[1]);
     return;
@@ -666,6 +893,74 @@ async function handleButton(query, env) {
     return;
   }
 
+  // Confirm buttons for /post and /broadcast: pst:post:<msgid>, pst:broadcast:<msgid>, pst:no
+  if (action === "pst") {
+    const edit = (text) => tg(env, "editMessageText", {
+      chat_id: chatId, message_id: messageId, text, parse_mode: "HTML",
+    });
+    if (parts[1] === "no") {
+      await edit("Cancelled.");
+      return;
+    }
+    const srcMsg = Number(parts[2]);
+
+    if (parts[1] === "post") {
+      const targets = await getPostTargets(env);
+      let ok = 0;
+      const failed = [];
+      for (const c of targets) {
+        const r = await tg(env, "copyMessage", { chat_id: c.chat_id, from_chat_id: chatId, message_id: srcMsg });
+        if (r.ok) ok++; else failed.push(c.title);
+      }
+      let text = `✅ Posted to ${ok} of ${targets.length} channel(s).`;
+      if (failed.length) {
+        text += `\n\n⚠️ Failed: ${failed.map(esc).join(", ")}\nCheck that I'm an admin there with the Post Messages permission.`;
+      }
+      await edit(text);
+      return;
+    }
+
+    if (parts[1] === "broadcast") {
+      const running = await env.DB.prepare("SELECT 1 AS x FROM broadcasts WHERE status = 'running' LIMIT 1").first();
+      if (running) {
+        await edit("⚠️ A broadcast is already running. Please wait for it to finish.");
+        return;
+      }
+      const total = await countBroadcastUsers(env);
+      await env.DB.prepare(
+        "INSERT INTO broadcasts (from_chat, message_id, owner_chat, total) VALUES (?, ?, ?, ?)"
+      ).bind(String(chatId), srcMsg, String(chatId), total).run();
+      await edit(`📢 Broadcast started for <b>${total}</b> users. I'll message you when it's finished.`);
+      await processBroadcast(env, 35);
+      return;
+    }
+    return;
+  }
+
+  // Cover images: cov:menu, cov:set:<pdf|lecture>, cov:rm:<pdf|lecture>
+  if (action === "cov") {
+    const sub = parts[1];
+    const kind = parts[2];
+    const validKind = kind === "pdf" || kind === "lecture";
+    if (sub === "set" && validKind) {
+      await setState(env, userId, `set:cover_${kind}`);
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: `🖼️ Send the photo to use as the <b>${kind === "pdf" ? "PDF" : "Lecture"} cover</b>. It will be shown on every new post.`,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "cov:menu" }]] },
+      });
+      return;
+    }
+    if (sub === "rm" && validKind) {
+      await env.DB.prepare("DELETE FROM settings WHERE key = ?").bind(`cover_${kind}`).run();
+    }
+    await clearState(env, userId);
+    await showCoverMenu(env, chatId, messageId);
+    return;
+  }
+
   // File delete settings: del:menu, del:set:<minutes>, del:custom
   if (action === "del") {
     const sub = parts[1];
@@ -764,15 +1059,34 @@ async function handleChannelPost(post, env) {
   const emoji = info.kind === "pdf" ? "📄" : "🎓";
   const label = info.kind === "pdf" ? "PDF" : "Lecture";
 
+  const postText = `${emoji} <b>${esc(title.slice(0, 300))}</b>\n\n🏷 Type: ${label}\n📦 Size: ${formatSize(info.file.file_size)}`;
+  const markup = {
+    inline_keyboard: [[
+      { text: "📥 Get File", url: `https://t.me/${me.result.username}?start=f${rowId}` },
+    ]],
+  };
+
+  // Cover: your saved cover first, otherwise the file's own thumbnail
+  const thumb = info.file.thumbnail || info.file.thumb;
+  const cover = (await getSetting(env, info.kind === "pdf" ? "cover_pdf" : "cover_lecture")) ||
+    (thumb ? thumb.file_id : null);
+
+  if (cover) {
+    const sent = await tg(env, "sendPhoto", {
+      chat_id: dest[0].chat_id,
+      photo: cover,
+      caption: postText,
+      parse_mode: "HTML",
+      reply_markup: markup,
+    });
+    if (sent.ok) return;
+    console.log("Cover failed, posting without it:", JSON.stringify(sent));
+  }
   await tg(env, "sendMessage", {
     chat_id: dest[0].chat_id,
-    text: `${emoji} <b>${esc(title)}</b>\n\n🏷 Type: ${label}\n📦 Size: ${formatSize(info.file.file_size)}`,
+    text: postText,
     parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "📥 Get File", url: `https://t.me/${me.result.username}?start=f${rowId}` },
-      ]],
-    },
+    reply_markup: markup,
   });
 }
 
@@ -780,7 +1094,7 @@ async function handleChannelPost(post, env) {
 export default {
   // Cron Trigger: runs every minute
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runDeletions(env));
+    ctx.waitUntil(runCron(env));
   },
 
   async fetch(request, env) {
