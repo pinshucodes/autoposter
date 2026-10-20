@@ -1,4 +1,4 @@
-// Autoposter Bot - Step 5: Shortlink (users pass a shortlink before getting files)
+// Autoposter Bot - Step 6: File auto-delete (sent files are removed after a delay)
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -120,11 +120,39 @@ function makeTitle(post, name) {
 
 async function sendFileToUser(env, chatId, row) {
   const asVideo = row.send_as === "video";
-  await tg(env, asVideo ? "sendVideo" : "sendDocument", {
+  const sent = await tg(env, asVideo ? "sendVideo" : "sendDocument", {
     chat_id: chatId,
     [asVideo ? "video" : "document"]: row.file_id,
     caption: row.title,
   });
+
+  // Auto-delete: warn the user and schedule removal
+  const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
+  if (!sent.ok || !mins) return;
+
+  const notice = await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `⚠️ This file will be deleted in <b>${formatDelay(mins)}</b>. Forward it or save it somewhere now.`,
+    parse_mode: "HTML",
+  });
+  const deleteAt = Date.now() + mins * 60 * 1000;
+  const ids = [sent.result.message_id];
+  if (notice.ok) ids.push(notice.result.message_id);
+  for (const id of ids) {
+    await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
+      .bind(String(chatId), id, deleteAt).run();
+  }
+}
+
+// Runs every minute (Cron Trigger): deletes messages whose time is up
+async function runDeletions(env) {
+  const due = await env.DB.prepare(
+    "SELECT id, chat_id, message_id FROM deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT 40"
+  ).bind(Date.now()).all();
+  for (const d of due.results || []) {
+    await tg(env, "deleteMessage", { chat_id: d.chat_id, message_id: d.message_id });
+    await env.DB.prepare("DELETE FROM deletions WHERE id = ?").bind(d.id).run();
+  }
 }
 
 // ---------- Simple saved settings ----------
@@ -230,14 +258,13 @@ const MAIN_MENU = {
     [{ text: "📄 PDFs Channel", callback_data: "role:pdfs" }],
     [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
     [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
-    [{ text: "🗑️ File Delete Settings", callback_data: "delete" }],
+    [{ text: "🗑️ File Delete Settings", callback_data: "del:menu" }],
     [{ text: "❌ Close", callback_data: "close" }],
   ],
 };
 
 // Placeholders for settings we build in later steps
 const SUB_MENUS = {
-  delete: "🗑️ <b>File Delete Settings</b>\n\nComing in a later step.",
 };
 
 const BACK_BUTTON = [[{ text: "⬅️ Back", callback_data: "back" }]];
@@ -282,6 +309,48 @@ async function showMainMenu(env, chatId, messageId) {
   });
 }
 
+// ---------- File delete settings menu ----------
+function formatDelay(mins) {
+  if (!mins) return "Off";
+  if (mins >= 60 && mins % 60 === 0) {
+    const h = mins / 60;
+    return h === 1 ? "1 hour" : `${h} hours`;
+  }
+  return `${mins} min`;
+}
+
+async function buildDeleteMenu(env, note) {
+  const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
+  let text = "🗑️ <b>File Delete Settings</b>\n\n" +
+    "Files sent by the bot are deleted from the user's chat after the time you choose. " +
+    "Telegram allows up to 47 hours.\n\n" +
+    `Current: <b>${formatDelay(mins)}</b>`;
+  if (note) text += `\n\n${note}`;
+
+  const choice = (label, value) => ({
+    text: (mins === value ? "✅ " : "") + label,
+    callback_data: `del:set:${value}`,
+  });
+  const buttons = [
+    [choice("Off", 0), choice("5 min", 5), choice("10 min", 10)],
+    [choice("30 min", 30), choice("1 hour", 60), choice("6 hours", 360)],
+    [choice("24 hours", 1440), { text: "✏️ Custom", callback_data: "del:custom" }],
+    ...BACK_BUTTON,
+  ];
+  return { text, buttons };
+}
+
+async function showDeleteMenu(env, chatId, messageId, note) {
+  const menu = await buildDeleteMenu(env, note);
+  await tg(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: menu.text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: menu.buttons },
+  });
+}
+
 // ---------- Shortlink settings menu ----------
 async function buildShortlinkMenu(env, note) {
   const domain = await getSetting(env, "shortlink_domain");
@@ -321,6 +390,26 @@ async function handleSettingInput(env, msg, field) {
   let value = (msg.text || "").trim();
   if (!value) {
     await tg(env, "sendMessage", { chat_id: chatId, text: "Please send it as text, or /cancel to stop." });
+    return;
+  }
+  if (field === "delete_minutes") {
+    const mins = parseInt(value, 10);
+    if (!/^\d+$/.test(value) || mins < 1 || mins > 2820) {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "Please send a number of minutes between 1 and 2820 (that's 47 hours), or /cancel to stop.",
+      });
+      return;
+    }
+    await setSetting(env, "delete_minutes", String(mins));
+    await clearState(env, userId);
+    const dmenu = await buildDeleteMenu(env, "✅ Saved.");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: dmenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: dmenu.buttons },
+    });
     return;
   }
   if (field === "shortlink_domain") {
@@ -577,6 +666,28 @@ async function handleButton(query, env) {
     return;
   }
 
+  // File delete settings: del:menu, del:set:<minutes>, del:custom
+  if (action === "del") {
+    const sub = parts[1];
+    if (sub === "custom") {
+      await setState(env, userId, "set:delete_minutes");
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: "✏️ Send the number of minutes (1 to 2820). For example, <code>90</code> means 1.5 hours.",
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "del:menu" }]] },
+      });
+      return;
+    }
+    if (sub === "set") {
+      await setSetting(env, "delete_minutes", String(parseInt(parts[2], 10) || 0));
+    }
+    await clearState(env, userId);
+    await showDeleteMenu(env, chatId, messageId);
+    return;
+  }
+
   // Shortlink settings: sl:menu, sl:toggle, sl:domain, sl:key
   if (action === "sl") {
     const sub = parts[1];
@@ -667,6 +778,11 @@ async function handleChannelPost(post, env) {
 
 // ---------- Entry point ----------
 export default {
+  // Cron Trigger: runs every minute
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runDeletions(env));
+  },
+
   async fetch(request, env) {
     if (request.method !== "POST") {
       return new Response("Autoposter bot is running ✅");
