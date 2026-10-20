@@ -6,3 +6,5 @@ compatibility_date = "2024-11-01"
 binding = "DB"
 database_name = "autoposter-db"
 database_id = "56b32f2a-afda-4869-a271-bc83afc5a7e1"
+[triggers]
+crons = ["* * * * *"]
