@@ -47,6 +47,14 @@ async function ensureExtraTables(env) {
         "updated INTEGER)"
       ),
       env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS media_post_channels (" +
+        "group_key TEXT, " +
+        "chat_id TEXT, " +
+        "message_id INTEGER, " +
+        "has_photo INTEGER, " +
+        "PRIMARY KEY (group_key, chat_id))"
+      ),
+      env.DB.prepare(
         "CREATE TABLE IF NOT EXISTS batches (" +
         "batch_id INTEGER PRIMARY KEY AUTOINCREMENT, " +
         "group_key TEXT, " +
