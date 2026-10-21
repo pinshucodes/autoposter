@@ -2624,7 +2624,7 @@ function sortQualities(a, b) {
   return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
 }
 
-async function buildChannelPostView(env, meta, info, items, showMediaInfo) {
+async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampleRowId) {
   const titleText = meta ? meta.title : info.cleanTitle;
   const yearText = (meta && meta.year) || info.year;
   const headerTitle = yearText ? `${titleText} (${yearText})` : titleText;
@@ -2642,7 +2642,6 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo) {
     if (meta.genres) lines.push(`🎭 <b>Genre:</b> ${esc(meta.genres)}`);
   }
 
-  // Aggregate Audio Languages & Codecs across uploaded items
   const allLangs = [];
   const allQuals = [];
   const allCodecs = [];
@@ -2669,9 +2668,12 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo) {
   lines.push("");
   const buttons = [];
 
+  if (sampleRowId) {
+    const sampleLink = await makeDeepLink(env, `f${sampleRowId}`);
+    buttons.push([{ text: "🎬 Watch 1-Min Sample Video", url: sampleLink }]);
+  }
+
   if (info.isSeries) {
-    // TV Series Season Batching:
-    // Group episodes by quality -> 1 button per quality (e.g., "🗂 S01 • 720p (8 EP)")
     const sNum = String(info.season || 1).padStart(2, "0");
     lines.push(`📦 <b>Select Quality below to get Season ${sNum} Episodes:</b>`);
 
@@ -2699,15 +2701,15 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo) {
     }
     if (rowBuf.length) buttons.push(rowBuf);
   } else {
-    // Movie Multi-Quality Grouping:
-    // Show each quality button with its exact file size
     lines.push(`⬇️ <b>Select Quality below to Download:</b>`);
     items.sort((a, b) => sortQualities(a.quality, b.quality));
     const rowBuf = [];
     for (const it of items) {
       const link = await makeDeepLink(env, `f${it.rowId}`);
+      const codecLabel = [it.source, it.vCodec].filter(Boolean).join(" ");
+      const btnText = codecLabel ? `⬇️ ${it.quality} (${codecLabel}) [${formatSize(it.size)}]` : `⬇️ ${it.quality} [${formatSize(it.size)}]`;
       rowBuf.push({
-        text: `⬇️ ${it.quality} [${formatSize(it.size)}]`,
+        text: btnText.slice(0, 60),
         url: link,
       });
       if (rowBuf.length === 2) {
@@ -2738,7 +2740,6 @@ async function upsertSeasonBatch(env, groupKey, quality, title, epEntry) {
   let items = [];
   try { items = JSON.parse(existing.items_json || "[]"); } catch (e) { items = []; }
 
-  // Replace if same episode number or same rowId already exists, otherwise append
   const idx = items.findIndex((x) =>
     x.rowId === epEntry.rowId || (epEntry.episode && x.season === epEntry.season && x.episode === epEntry.episode)
   );
@@ -2772,7 +2773,6 @@ async function handleChannelPost(post, env) {
   });
   if (!rowId) return;
 
-  // 1. Handle PDF posts
   if (info.kind === "pdf") {
     const targets = await getChannels(env, "pdfs");
     if (!targets.length) return;
@@ -2794,11 +2794,12 @@ async function handleChannelPost(post, env) {
     return;
   }
 
-  // 2. Handle Movies & TV Series Episodes (up to 50 channels)
   const targets = (await getChannels(env, "lectures")).slice(0, 50);
   if (!targets.length) return;
 
   await ensureExtraTables(env);
+  const fullText = `${info.name || ""} ${post.caption || ""}`;
+  const isSample = /\bsample\b/i.test(fullText);
   const parsed = parseMediaFilename(info.name, post.caption || "");
   const groupOn = (await getSetting(env, "group_qualities")) !== "0";
   const showMediaInfo = (await getSetting(env, "mediainfo_enabled")) !== "0";
@@ -2809,6 +2810,7 @@ async function handleChannelPost(post, env) {
 
   let meta = null;
   let items = [];
+  let sampleRowId = existingPost ? JSON.parse(existingPost.meta_json || "{}").sampleRowId || null : null;
 
   if (existingPost) {
     try { meta = JSON.parse(existingPost.meta_json || "null"); } catch (e) { meta = null; }
@@ -2817,47 +2819,57 @@ async function handleChannelPost(post, env) {
     meta = await fetchMediaMeta(env, parsed);
   }
 
-  const displayTitle = (meta && meta.title)
-    ? (parsed.isSeries ? `${meta.title} S${String(parsed.season || 1).padStart(2, "0")}` : meta.title)
-    : (parsed.isSeries ? `${parsed.cleanTitle} S${String(parsed.season || 1).padStart(2, "0")}` : parsed.cleanTitle);
-
-  let batchId = null;
-  if (parsed.isSeries) {
-    batchId = await upsertSeasonBatch(env, parsed.groupKey, parsed.quality, displayTitle, {
-      rowId,
-      season: parsed.season || 1,
-      episode: parsed.episode || (items.filter((x) => x.quality === parsed.quality).length + 1),
-      size: info.file.file_size || 0,
-      audioLangs: parsed.audioLangs,
-    });
-  }
-
-  const newItem = {
-    rowId,
-    batchId,
-    quality: parsed.quality,
-    season: parsed.season,
-    episode: parsed.episode,
-    size: info.file.file_size || 0,
-    source: parsed.source,
-    vCodec: parsed.vCodec,
-    aCodec: parsed.aCodec,
-    audioLangs: parsed.audioLangs,
-  };
-
-  if (parsed.isSeries) {
-    const idx = items.findIndex((x) =>
-      x.rowId === rowId || (parsed.episode && x.quality === parsed.quality && x.episode === parsed.episode)
-    );
-    if (idx >= 0) items[idx] = newItem;
-    else items.push(newItem);
+  if (isSample) {
+    sampleRowId = rowId;
+    if (meta) meta.sampleRowId = sampleRowId;
   } else {
-    const idx = items.findIndex((x) => x.quality === parsed.quality);
-    if (idx >= 0) items[idx] = newItem;
-    else items.push(newItem);
+    const displayTitle = (meta && meta.title)
+      ? (parsed.isSeries ? `${meta.title} S${String(parsed.season || 1).padStart(2, "0")}` : meta.title)
+      : (parsed.isSeries ? `${parsed.cleanTitle} S${String(parsed.season || 1).padStart(2, "0")}` : parsed.cleanTitle);
+
+    let batchId = null;
+    if (parsed.isSeries) {
+      batchId = await upsertSeasonBatch(env, parsed.groupKey, parsed.quality, displayTitle, {
+        rowId,
+        season: parsed.season || 1,
+        episode: parsed.episode || (items.filter((x) => x.quality === parsed.quality).length + 1),
+        size: info.file.file_size || 0,
+        audioLangs: parsed.audioLangs,
+      });
+    }
+
+    const newItem = {
+      rowId,
+      batchId,
+      quality: parsed.quality,
+      season: parsed.season,
+      episode: parsed.episode,
+      size: info.file.file_size || 0,
+      source: parsed.source,
+      vCodec: parsed.vCodec,
+      aCodec: parsed.aCodec,
+      audioLangs: parsed.audioLangs,
+    };
+
+    if (parsed.isSeries) {
+      const idx = items.findIndex((x) =>
+        x.rowId === rowId || (parsed.episode && x.quality === parsed.quality && x.episode === parsed.episode)
+      );
+      if (idx >= 0) items[idx] = newItem;
+      else items.push(newItem);
+    } else {
+      const fileSignature = `${parsed.quality}-${parsed.source}-${parsed.vCodec}`.toLowerCase();
+      const idx = items.findIndex((x) => {
+        const xSig = `${x.quality}-${x.source}-${x.vCodec}`.toLowerCase();
+        return x.rowId === rowId || xSig === fileSignature;
+      });
+      if (idx >= 0) items[idx] = newItem;
+      else items.push(newItem);
+    }
   }
 
-  const view = await buildChannelPostView(env, meta, parsed, items, showMediaInfo);
+  if (meta) meta.sampleRowId = sampleRowId;
+  const view = await buildChannelPostView(env, meta, parsed, items, showMediaInfo, sampleRowId);
 
   const chanMap = {};
   if (groupOn) {
@@ -2961,6 +2973,16 @@ async function handleChannelPost(post, env) {
       Date.now()
     ).run();
   }
+}
+
+// ---------- Constant-time string compare for webhook & HMAC ----------
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 // ---------- Constant-time string compare for webhook & HMAC ----------
