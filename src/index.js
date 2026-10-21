@@ -509,6 +509,28 @@ async function handleSettingInput(env, msg, field) {
     return;
   }
 
+  if (field === "stars_prices") {
+    const nums = (msg.text || "").trim().split(/[\s,]+/).map(Number);
+    if (nums.length !== 4 || nums.some((n) => !Number.isInteger(n) || n < 1 || n > 100000)) {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "Please send 4 whole numbers in this order: week, month, 2 months, year. Example: 12 35 58 290\n\n/cancel to stop.",
+      });
+      return;
+    }
+    const keys = Object.keys(PLANS);
+    for (let k = 0; k < keys.length; k++) await setSetting(env, `stars_${keys[k]}`, String(nums[k]));
+    await clearState(env, userId);
+    const smenu = await buildPayMenu(env, "✅ Star prices saved.");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: smenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: smenu.buttons },
+    });
+    return;
+  }
+
   if (field === "upi_id" || field === "upi_name") {
     const v = (msg.text || "").trim();
     const valid = field === "upi_id"
@@ -883,6 +905,9 @@ async function sendStatus(env, chatId) {
   if (hook.ok) {
     const h = hook.result;
     lines.push(`${h.url ? "✅" : "⚠️"} Webhook: ${h.url ? "set" : "NOT set"}, waiting updates: ${h.pending_update_count}`);
+    if (h.allowed_updates && !h.allowed_updates.includes("pre_checkout_query")) {
+      lines.push("⚠️ Webhook is not receiving payment updates. Re-run the setWebhook link with pre_checkout_query added, or Stars payments will fail.");
+    }
     if (h.last_error_message) {
       const when = h.last_error_date ? new Date(h.last_error_date * 1000).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "";
       lines.push(`⚠️ Last Telegram delivery error: ${esc(h.last_error_message)} ${when}`);
@@ -916,6 +941,7 @@ async function sendStatus(env, chatId) {
   const upiId = await getSetting(env, "upi_id");
   const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE status = 'submitted'").first();
   lines.push(upiId ? `✅ Payments: UPI set, ${waiting.n} waiting for your approval` : "➖ Payments: UPI ID not set");
+  lines.push((await starsEnabled(env)) ? "✅ Payments: Stars on" : "➖ Payments: Stars off");
 
   // Channels: am I still an admin?
   const me = await tg(env, "getMe", {});
@@ -945,6 +971,23 @@ const PLANS = {
   two: { name: "2 Months", price: 100, days: 60 },
   year: { name: "1 Year", price: 500, days: 365 },
 };
+
+// Starting Star prices. Change them any time in /settings -> Payments -> Set Star Prices.
+// Stars cost users more than they pay you, so check Telegram's current rates before you finalize these.
+const STAR_DEFAULTS = { week: 12, month: 35, two: 58, year: 290 };
+
+async function getStarPrices(env) {
+  const out = {};
+  for (const key of Object.keys(PLANS)) {
+    const v = parseInt((await getSetting(env, `stars_${key}`)) || "", 10);
+    out[key] = v > 0 ? v : STAR_DEFAULTS[key];
+  }
+  return out;
+}
+
+async function starsEnabled(env) {
+  return (await getSetting(env, "stars_off")) !== "1";
+}
 
 let APP_ORIGIN = null; // this Worker's web address, learned from incoming requests
 
@@ -1028,10 +1071,12 @@ async function handleApi(request, env, path) {
     const w = await env.DB.prepare(
       "SELECT id, plan, amount FROM payments WHERE user_id = ? AND status = 'submitted' ORDER BY id DESC LIMIT 1"
     ).bind(uid).first();
+    const starPrices = await getStarPrices(env);
     return json({
       premium_until: until ? fmtDate(until) : null,
       upi_ready: !!upiId,
-      plans: Object.entries(PLANS).map(([key, p]) => ({ key, name: p.name, price: p.price, days: p.days })),
+      stars_ready: await starsEnabled(env),
+      plans: Object.entries(PLANS).map(([key, p]) => ({ key, name: p.name, price: p.price, days: p.days, stars: starPrices[key] })),
       waiting: w ? { plan_name: PLANS[w.plan].name, amount: w.amount } : null,
     });
   }
@@ -1052,6 +1097,33 @@ async function handleApi(request, env, path) {
     const link = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payee)}` +
       `&am=${plan.price}.00&cu=INR&tn=${encodeURIComponent("Premium " + plan.name)}`;
     return json({ id: ins.meta.last_row_id, plan: plan.name, amount: plan.price, upi_id: upiId, payee, link });
+  }
+
+  if (path === "/api/stars") {
+    if (!(await starsEnabled(env))) return json({ error: "Stars payments aren't available right now." }, 400);
+    const plan = PLANS[body.plan];
+    if (!plan) return json({ error: "Unknown plan." }, 400);
+    const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE user_id = ? AND created > ?")
+      .bind(uid, Date.now() - 3600000).first();
+    if (recent.n >= 8) return json({ error: "Too many attempts. Please try again in a while." }, 429);
+
+    // The price always comes from the server, never from the app
+    const stars = (await getStarPrices(env))[body.plan];
+    const ins = await env.DB.prepare(
+      "INSERT INTO payments (user_id, plan, amount, status, method, created) VALUES (?, ?, ?, 'pending', 'stars', ?)"
+    ).bind(uid, body.plan, stars, Date.now()).run();
+    const inv = await tg(env, "createInvoiceLink", {
+      title: `Premium - ${plan.name}`,
+      description: `Skip the ads for ${plan.name}. Active right after payment.`,
+      payload: `pay:${ins.meta.last_row_id}`,
+      currency: "XTR",
+      prices: [{ label: plan.name, amount: stars }],
+    });
+    if (!inv.ok) {
+      console.log("Invoice failed:", inv.description);
+      return json({ error: "Couldn't start the payment. Please try again." }, 500);
+    }
+    return json({ link: inv.result, stars });
   }
 
   if (path === "/api/utr") {
@@ -1085,6 +1157,58 @@ async function handleApi(request, env, path) {
   return json({ error: "Not found" }, 404);
 }
 
+// ---------- Telegram Stars ----------
+// Telegram asks "can this payment go ahead?" and wants an answer within 10 seconds
+async function handlePreCheckout(q, env) {
+  let ok = false;
+  try {
+    const m = /^pay:(\d+)$/.exec(q.invoice_payload || "");
+    const pay = m ? await env.DB.prepare("SELECT * FROM payments WHERE id = ?").bind(Number(m[1])).first() : null;
+    const ban = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(String(q.from.id)).first();
+    ok = !!pay && pay.method === "stars" && pay.status === "pending" &&
+      pay.user_id === String(q.from.id) && q.currency === "XTR" && q.total_amount === pay.amount &&
+      !(ban && ban.banned);
+  } catch (err) {
+    console.log("Pre-checkout error:", String(err).split(env.BOT_TOKEN).join("***"));
+  }
+  await tg(env, "answerPreCheckoutQuery", ok
+    ? { pre_checkout_query_id: q.id, ok: true }
+    : { pre_checkout_query_id: q.id, ok: false, error_message: "Sorry, this payment can't be completed. Please try again." });
+}
+
+// Telegram confirms the Stars really arrived. Turns Premium on, once.
+async function handleStarsPaid(env, msg) {
+  const sp = msg.successful_payment;
+  if (sp.currency !== "XTR") return;
+  const uid = String(msg.from.id);
+  const charge = sp.telegram_payment_charge_id;
+  try {
+    const m = /^pay:(\d+)$/.exec(sp.invoice_payload || "");
+    const pay = m ? await env.DB.prepare("SELECT * FROM payments WHERE id = ?").bind(Number(m[1])).first() : null;
+    if (!pay || pay.method !== "stars" || pay.user_id !== uid) {
+      await alertOwner(env, `stars_unknown${charge}`,
+        `A Stars payment arrived that I can't match: user ${uid}, ${sp.total_amount} Stars, charge ID ${charge}. Please check it and use /grant if it's valid.`);
+      return;
+    }
+    // Only the first confirmation counts, even if Telegram sends it twice
+    const claim = await env.DB.prepare(
+      "UPDATE payments SET status = 'approved', utr = ?, decided = ? WHERE id = ? AND status = 'pending'"
+    ).bind(`stars:${charge}`, Date.now(), pay.id).run();
+    if (!claim.meta.changes) return;
+
+    const exp = await activateSubscription(env, uid, pay.plan);
+    const plan = PLANS[pay.plan];
+    await tg(env, "sendMessage", { chat_id: uid, text: `✅ Payment received! Premium is active until ${fmtDate(exp)}. Enjoy ad-free downloads.` });
+    await tg(env, "sendMessage", {
+      chat_id: env.OWNER_ID,
+      text: `⭐ New Stars payment: user ${uid}, ${plan.name}, ${pay.amount} Stars. Premium until ${fmtDate(exp)}.`,
+    });
+  } catch (err) {
+    await alertOwner(env, `stars_error${charge}`,
+      `A Stars payment from user ${uid} (${sp.total_amount} Stars, charge ID ${charge}) was received but I hit an error activating Premium. Please use /grant ${uid} <plan>. Error: ${String(err).slice(0, 200)}`);
+  }
+}
+
 // ---------- /skipads and the payments settings ----------
 async function sendSkipAds(env, chatId, userId) {
   if (!APP_ORIGIN) {
@@ -1115,8 +1239,15 @@ async function buildPayMenu(env, note) {
     `Payee name: ${name ? esc(name) : "<i>not set (shows Premium)</i>"}\n` +
     `Waiting for approval: ${waiting.n}\n\n<b>Plans</b>\n` +
     Object.values(PLANS).map((p) => `${p.name}: ₹${p.price}`).join("\n");
+  const stars = await getStarPrices(env);
+  const starsOn = await starsEnabled(env);
+  text += `\n\n⭐ <b>Telegram Stars: ${starsOn ? "ON" : "OFF"}</b>\n` +
+    Object.entries(PLANS).map(([k, p]) => `${p.name}: ${stars[k]} Stars`).join("\n") +
+    "\nStars payments are confirmed by Telegram automatically.";
   if (note) text += `\n\n${note}`;
   const buttons = [
+    [{ text: starsOn ? "⭐ Stars: ON (tap to turn off)" : "⭐ Stars: OFF (tap to turn on)", callback_data: "pay:startoggle" }],
+    [{ text: "⭐ Set Star Prices", callback_data: "pay:stars" }],
     [{ text: "🆔 Set UPI ID", callback_data: "pay:upi" }],
     [{ text: "📝 Set Payee Name", callback_data: "pay:name" }],
     ...BACK_BUTTON,
@@ -1153,6 +1284,7 @@ ol{padding-left:20px;margin:6px 0 12px;color:var(--hint);font-size:15px}
 var tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 var root = document.getElementById("root");
+var ME = null;
 
 function el(tag, cls, text) {
   var e = document.createElement(tag);
@@ -1182,6 +1314,7 @@ function load() {
   root.appendChild(el("p", "sub", "Loading..."));
   api("/api/me").then(function (me) {
     if (me.error) return fail(me.error);
+    ME = me;
     home(me);
   });
 }
@@ -1206,17 +1339,58 @@ function home(me) {
     w.appendChild(r);
     root.appendChild(w);
   }
-  if (!me.upi_ready) {
+  if (!me.upi_ready && !me.stars_ready) {
     root.appendChild(el("p", "sub", "Payments aren't set up yet. Please try again later."));
     return;
   }
   me.plans.forEach(function (p) {
     var b = el("button", "card plan");
     b.appendChild(el("span", null, p.name));
-    b.appendChild(el("b", null, "Rs " + p.price));
-    b.onclick = function () { startPay(p); };
+    b.appendChild(el("b", null, me.upi_ready ? "Rs " + p.price : "\\u2B50 " + p.stars));
+    b.onclick = function () { choose(p); };
     root.appendChild(b);
   });
+}
+function choose(p) {
+  if (ME.upi_ready && ME.stars_ready) return methods(p);
+  if (ME.stars_ready) return startStars(p);
+  startPay(p);
+}
+function methods(p) {
+  clear();
+  root.appendChild(el("h1", null, p.name));
+  root.appendChild(el("p", "sub", "Choose how you'd like to pay."));
+  var u = el("button", "btn", "Pay with UPI - Rs " + p.price);
+  u.onclick = function () { startPay(p); };
+  root.appendChild(u);
+  var st = el("button", "btn", "Pay with Stars - \\u2B50 " + p.stars);
+  st.onclick = function () { startStars(p); };
+  root.appendChild(st);
+  var back = el("button", "btn ghost", "Back");
+  back.onclick = load;
+  root.appendChild(back);
+}
+function startStars(p) {
+  api("/api/stars", { plan: p.key }).then(function (d) {
+    if (d.error) return fail(d.error);
+    if (tg && tg.openInvoice) {
+      tg.openInvoice(d.link, function (status) {
+        if (status === "paid") return paid();
+        if (status === "failed") return fail("The payment didn't go through. You were not charged.");
+        load();
+      });
+    } else if (tg) {
+      tg.openTelegramLink(d.link);
+    }
+  });
+}
+function paid() {
+  clear();
+  root.appendChild(el("h1", null, "Payment received!"));
+  root.appendChild(el("p", "sub", "Premium turns on in a moment. You'll get a message in the bot."));
+  var b = el("button", "btn", "Check my plan");
+  b.onclick = load;
+  root.appendChild(b);
 }
 function startPay(p) {
   api("/api/pay", { plan: p.key }).then(function (d) {
@@ -1291,6 +1465,11 @@ async function handleMessage(msg, env) {
     return;
   }
   if (!msg.from) return;
+
+  if (msg.successful_payment) {
+    await handleStarsPaid(env, msg);
+    return;
+  }
 
   const text = msg.text || "";
   const chatId = msg.chat.id;
@@ -1715,6 +1894,20 @@ async function handleButton(query, env) {
   // Payments: pay:menu, pay:upi, pay:name, pay:ok:<id>, pay:no:<id>
   if (action === "pay") {
     const sub = parts[1];
+    if (sub === "stars") {
+      await setState(env, userId, "set:stars_prices");
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: "⭐ Send the 4 Star prices in this order: week, month, 2 months, year.\n\nExample: <code>12 35 58 290</code>",
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "pay:menu" }]] },
+      });
+      return;
+    }
+    if (sub === "startoggle") {
+      await setSetting(env, "stars_off", (await starsEnabled(env)) ? "1" : "0");
+    }
     if (sub === "upi" || sub === "name") {
       await setState(env, userId, `set:upi_${sub === "upi" ? "id" : "name"}`);
       await tg(env, "editMessageText", {
@@ -1931,6 +2124,7 @@ export default {
       if (update.message) await handleMessage(update.message, env);
       if (update.callback_query) await handleButton(update.callback_query, env);
       if (update.channel_post) await handleChannelPost(update.channel_post, env);
+      if (update.pre_checkout_query) await handlePreCheckout(update.pre_checkout_query, env);
     } catch (err) {
       const detail = String(err && err.stack ? err.stack : err).split(env.BOT_TOKEN).join("***");
       console.log("Error:", detail);
