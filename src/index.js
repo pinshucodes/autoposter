@@ -1,4 +1,4 @@
-// Autoposter Bot - Phase 1 (security and reliability) + Mini App payments (UPI)
+// Autoposter Bot - Phase 1 (security and reliability) + Mini App payments (UPI) + IMDb/TMDb/MediaInfo
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -41,7 +41,7 @@ const ROLES = {
   },
   lectures: {
     emoji: "🎓", name: "Lectures Channel", multi: false,
-    help: "The channel where lecture posts will be published.",
+    help: "The channel where lecture/video posts will be published.",
   },
   pdfs: {
     emoji: "📄", name: "PDFs Channel", multi: false,
@@ -119,7 +119,7 @@ function classifyPost(post) {
     if (mime === "application/pdf" || /\.pdf$/i.test(name)) {
       return { kind: "pdf", send_as: "document", file: d, name };
     }
-    if (mime.startsWith("video/")) {
+    if (mime.startsWith("video/") || /\.(mkv|mp4|avi|mov|webm|flv|m4v)$/i.test(name)) {
       return { kind: "lecture", send_as: "document", file: d, name };
     }
   }
@@ -326,6 +326,7 @@ const MAIN_MENU = {
     [{ text: "🎓 Lectures Channel", callback_data: "role:lectures" }],
     [{ text: "📄 PDFs Channel", callback_data: "role:pdfs" }],
     [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
+    [{ text: "🎬 IMDb, TMDb & MediaInfo", callback_data: "meta:menu" }],
     [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "del:menu" }],
     [{ text: "🖼️ Cover Images", callback_data: "cov:menu" }],
@@ -385,7 +386,7 @@ async function buildCoverMenu(env, note) {
   const pdf = await getSetting(env, "cover_pdf");
   const lec = await getSetting(env, "cover_lecture");
   let text = "🖼️ <b>Cover Images</b>\n\n" +
-    "A cover is the picture shown on each channel post. If none is set, I use the file's own thumbnail when it has one.\n\n" +
+    "A cover is the picture shown on each channel post. If none is set, I use the movie poster (if IMDb/TMDb is ON) or the file's own thumbnail.\n\n" +
     `📄 PDF cover: ${pdf ? "✅ Set" : "❌ Not set"}\n` +
     `🎓 Lecture cover: ${lec ? "✅ Set" : "❌ Not set"}`;
   if (note) text += `\n\n${note}`;
@@ -453,6 +454,31 @@ async function showDeleteMenu(env, chatId, messageId, note) {
   });
 }
 
+// ---------- IMDb, TMDb & MediaInfo settings menu ----------
+async function buildMetaMenu(env, note) {
+  const metaOn = (await getSetting(env, "meta_enabled")) === "1";
+  const miOn = (await getSetting(env, "mediainfo_enabled")) !== "0"; // ON by default
+  const tmdbKey = await getSetting(env, "tmdb_key");
+  const omdbKey = await getSetting(env, "omdb_key");
+
+  let text = "🎬 <b>IMDb, TMDb & MediaInfo</b>\n\n" +
+    "Automatically enriches video posts with IMDb/TMDb ratings, posters, genres, plot, and technical MediaInfo (resolution, codecs, audio, bitrate, duration).\n\n" +
+    `IMDb/TMDb Auto-Fetch: ${metaOn ? "✅ ON" : "❌ OFF"}\n` +
+    `MediaInfo Display: ${miOn ? "✅ ON" : "❌ OFF"}\n` +
+    `TMDb API Key: ${tmdbKey ? "<code>" + esc(tmdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n` +
+    `OMDb (IMDb) Key: ${omdbKey ? "<code>" + esc(omdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}`;
+  if (note) text += `\n\n${note}`;
+
+  const buttons = [
+    [{ text: metaOn ? "🔴 Turn OFF IMDb/TMDb" : "🟢 Turn ON IMDb/TMDb", callback_data: "meta:toggle" }],
+    [{ text: miOn ? "📊 Turn OFF MediaInfo" : "📊 Turn ON MediaInfo", callback_data: "meta:mitoggle" }],
+    [{ text: "🔑 Set TMDb API Key", callback_data: "meta:tmdb" }],
+    [{ text: "🔑 Set OMDb (IMDb) Key", callback_data: "meta:omdb" }],
+    ...BACK_BUTTON,
+  ];
+  return { text, buttons };
+}
+
 // ---------- Shortlink settings menu ----------
 async function buildShortlinkMenu(env, note) {
   const domain = await getSetting(env, "shortlink_domain");
@@ -485,7 +511,7 @@ async function showShortlinkMenu(env, chatId, messageId, note) {
   });
 }
 
-// Owner typed a new domain or API key
+// Owner typed a new setting value
 async function handleSettingInput(env, msg, field) {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
@@ -579,6 +605,19 @@ async function handleSettingInput(env, msg, field) {
       text: dmenu.text,
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: dmenu.buttons },
+    });
+    return;
+  }
+  if (field === "tmdb_key" || field === "omdb_key") {
+    await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+    await setSetting(env, field, value);
+    await clearState(env, userId);
+    const mmenu = await buildMetaMenu(env, "✅ API key saved.");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: mmenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: mmenu.buttons },
     });
     return;
   }
@@ -936,6 +975,8 @@ async function sendStatus(env, chatId) {
   } else {
     lines.push("➖ Shortlink: off");
   }
+  const metaOn = (await getSetting(env, "meta_enabled")) === "1";
+  lines.push(metaOn ? "✅ IMDb/TMDb: on" : "➖ IMDb/TMDb: off");
   const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
   lines.push(`➖ Auto-delete: ${formatDelay(mins)}`);
   const upiId = await getSetting(env, "upi_id");
@@ -972,8 +1013,6 @@ const PLANS = {
   year: { name: "1 Year", price: 500, days: 365 },
 };
 
-// Starting Star prices. Change them any time in /settings -> Payments -> Set Star Prices.
-// Stars cost users more than they pay you, so check Telegram's current rates before you finalize these.
 const STAR_DEFAULTS = { week: 12, month: 35, two: 58, year: 290 };
 
 async function getStarPrices(env) {
@@ -1085,7 +1124,6 @@ async function handleApi(request, env, path) {
     if (!upiId) return json({ error: "Payments aren't set up yet." }, 400);
     const plan = PLANS[body.plan];
     if (!plan) return json({ error: "Unknown plan." }, 400);
-    // The price always comes from the server, never from the app
     const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE user_id = ? AND created > ?")
       .bind(uid, Date.now() - 3600000).first();
     if (recent.n >= 8) return json({ error: "Too many attempts. Please try again in a while." }, 429);
@@ -1107,7 +1145,6 @@ async function handleApi(request, env, path) {
       .bind(uid, Date.now() - 3600000).first();
     if (recent.n >= 8) return json({ error: "Too many attempts. Please try again in a while." }, 429);
 
-    // The price always comes from the server, never from the app
     const stars = (await getStarPrices(env))[body.plan];
     const ins = await env.DB.prepare(
       "INSERT INTO payments (user_id, plan, amount, status, method, created) VALUES (?, ?, ?, 'pending', 'stars', ?)"
@@ -1136,7 +1173,6 @@ async function handleApi(request, env, path) {
         .bind(utr, pay.id).run();
       if (!upd.meta.changes) return json({ error: "This payment can't be updated." }, 400);
     } catch (err) {
-      // The same reference number can't be used for two payments
       return json({ error: "This reference number was already used." }, 400);
     }
     const plan = PLANS[pay.plan];
@@ -1158,7 +1194,6 @@ async function handleApi(request, env, path) {
 }
 
 // ---------- Telegram Stars ----------
-// Telegram asks "can this payment go ahead?" and wants an answer within 10 seconds
 async function handlePreCheckout(q, env) {
   let ok = false;
   try {
@@ -1176,7 +1211,6 @@ async function handlePreCheckout(q, env) {
     : { pre_checkout_query_id: q.id, ok: false, error_message: "Sorry, this payment can't be completed. Please try again." });
 }
 
-// Telegram confirms the Stars really arrived. Turns Premium on, once.
 async function handleStarsPaid(env, msg) {
   const sp = msg.successful_payment;
   if (sp.currency !== "XTR") return;
@@ -1190,7 +1224,6 @@ async function handleStarsPaid(env, msg) {
         `A Stars payment arrived that I can't match: user ${uid}, ${sp.total_amount} Stars, charge ID ${charge}. Please check it and use /grant if it's valid.`);
       return;
     }
-    // Only the first confirmation counts, even if Telegram sends it twice
     const claim = await env.DB.prepare(
       "UPDATE payments SET status = 'approved', utr = ?, decided = ? WHERE id = ? AND status = 'pending'"
     ).bind(`stars:${charge}`, Date.now(), pay.id).run();
@@ -1459,7 +1492,6 @@ load();
 
 // ---------- Handling messages ----------
 async function handleMessage(msg, env) {
-  // Files posted in a Source group (anything that isn't a private chat with the bot)
   if (msg.chat.type !== "private") {
     await handleChannelPost(msg, env);
     return;
@@ -1483,7 +1515,6 @@ async function handleMessage(msg, env) {
   }
 
   if (text.startsWith("/start")) {
-    // Coming back from the shortlink: /start v<token>
     const tok = text.match(/^\/start v([A-Za-z0-9]+)/);
     if (tok) {
       const t = await env.DB.prepare("SELECT file_row_id, user_id, created FROM tokens WHERE token = ?")
@@ -1497,7 +1528,6 @@ async function handleMessage(msg, env) {
         });
         return;
       }
-      // Back too fast = they skipped the shortlink. Keep the token so they can still do it properly.
       if (Date.now() - t.created < MIN_VERIFY_SECONDS * 1000) {
         await tg(env, "sendMessage", {
           chat_id: chatId,
@@ -1505,7 +1535,6 @@ async function handleMessage(msg, env) {
         });
         return;
       }
-      // The token works once, even if two taps arrive together
       const used = await env.DB.prepare("DELETE FROM tokens WHERE token = ?").bind(tok[1]).run();
       if (!used.meta.changes) return;
       await env.DB.prepare("INSERT INTO verifications (user_id, file_row_id, day) VALUES (?, ?, ?)")
@@ -1519,7 +1548,6 @@ async function handleMessage(msg, env) {
       return;
     }
 
-    // Links from channel posts look like /start f12
     const match = text.match(/^\/start f(\d+)/);
     if (match) {
       const row = await getFileRow(env, Number(match[1]));
@@ -1636,7 +1664,6 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  // Are we waiting for the owner to send a channel?
   const state = await getState(env, userId);
   if (state === "post" || state === "broadcast") {
     await askConfirm(env, msg, state);
@@ -1686,7 +1713,6 @@ async function handleButton(query, env) {
   const parts = query.data.split(":");
   const action = parts[0];
 
-  // "I've Joined" button - anyone can use this one
   if (action === "chk") {
     if (userId !== String(env.OWNER_ID)) {
       const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
@@ -1737,14 +1763,12 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Open a channel menu: role:source
   if (action === "role" && ROLES[parts[1]]) {
     await clearState(env, userId);
     await showRoleMenu(env, chatId, messageId, parts[1]);
     return;
   }
 
-  // Start adding a channel: add:source
   if (action === "add" && ROLES[parts[1]]) {
     const role = parts[1];
     await setState(env, userId, `add:${role}`);
@@ -1761,14 +1785,12 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Remove a channel: rm:source:-100123...
   if (action === "rm" && ROLES[parts[1]]) {
     await removeChannel(env, parts[1], parts.slice(2).join(":"));
     await showRoleMenu(env, chatId, messageId, parts[1]);
     return;
   }
 
-  // /broadcast confirm: pst:broadcast:<msgid>, pst:no
   if (action === "pst") {
     const edit = (text) => tg(env, "editMessageText", {
       chat_id: chatId, message_id: messageId, text, parse_mode: "HTML",
@@ -1794,7 +1816,6 @@ async function handleButton(query, env) {
     return;
   }
 
-  // /post channel picker: pk:t:<index>, pk:go, pk:no
   if (action === "pk") {
     const edit = (text, markup) => tg(env, "editMessageText", {
       chat_id: chatId, message_id: messageId, text, parse_mode: "HTML", reply_markup: markup,
@@ -1845,7 +1866,6 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Cover images: cov:menu, cov:set:<pdf|lecture>, cov:rm:<pdf|lecture>
   if (action === "cov") {
     const sub = parts[1];
     const kind = parts[2];
@@ -1869,7 +1889,6 @@ async function handleButton(query, env) {
     return;
   }
 
-  // File delete settings: del:menu, del:set:<minutes>, del:custom
   if (action === "del") {
     const sub = parts[1];
     if (sub === "custom") {
@@ -1891,7 +1910,6 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Payments: pay:menu, pay:upi, pay:name, pay:ok:<id>, pay:no:<id>
   if (action === "pay") {
     const sub = parts[1];
     if (sub === "stars") {
@@ -1927,7 +1945,6 @@ async function handleButton(query, env) {
       const edit = (text) => tg(env, "editMessageText", { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" });
       if (!pay) { await edit("Payment not found."); return; }
       const approve = sub === "ok";
-      // Only a payment that is still waiting can be decided, and only once
       const upd = await env.DB.prepare("UPDATE payments SET status = ?, decided = ? WHERE id = ? AND status = 'submitted'")
         .bind(approve ? "approved" : "rejected", Date.now(), id).run();
       if (!upd.meta.changes) { await edit(`This payment was already ${esc(pay.status)}.`); return; }
@@ -1947,6 +1964,50 @@ async function handleButton(query, env) {
     await tg(env, "editMessageText", {
       chat_id: chatId, message_id: messageId, text: pm.text, parse_mode: "HTML",
       reply_markup: { inline_keyboard: pm.buttons },
+    });
+    return;
+  }
+
+  // IMDb, TMDb & MediaInfo settings: meta:menu, meta:toggle, meta:mitoggle, meta:tmdb, meta:omdb
+  if (action === "meta") {
+    const sub = parts[1];
+    if (sub === "tmdb" || sub === "omdb") {
+      await setState(env, userId, `set:${sub}_key`);
+      const prompt = sub === "tmdb"
+        ? "🔑 Send your <b>TMDb API Key (v3 auth)</b> from themoviedb.org.\n\nI'll delete your message right after saving it."
+        : "🔑 Send your <b>OMDb API Key</b> from omdbapi.com.\n\nI'll delete your message right after saving it.";
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: prompt,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "meta:menu" }]] },
+      });
+      return;
+    }
+    let note = "";
+    if (sub === "toggle") {
+      const on = (await getSetting(env, "meta_enabled")) === "1";
+      if (on) {
+        await setSetting(env, "meta_enabled", "0");
+      } else if (!(await getSetting(env, "tmdb_key")) && !(await getSetting(env, "omdb_key"))) {
+        note = "⚠️ Set at least one API key (TMDb or OMDb) first.";
+      } else {
+        await setSetting(env, "meta_enabled", "1");
+      }
+    }
+    if (sub === "mitoggle") {
+      const miOn = (await getSetting(env, "mediainfo_enabled")) !== "0";
+      await setSetting(env, "mediainfo_enabled", miOn ? "0" : "1");
+    }
+    await clearState(env, userId);
+    const mmenu = await buildMetaMenu(env, note);
+    await tg(env, "editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text: mmenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: mmenu.buttons },
     });
     return;
   }
@@ -1995,22 +2056,207 @@ async function handleButton(query, env) {
   }
 }
 
+// ---------- IMDb, TMDb & MediaInfo Helpers ----------
+function parseMediaTitle(raw) {
+  const firstLine = (raw || "").split("\n")[0].trim();
+  const base = firstLine.replace(/\.[a-zA-Z0-9]{2,4}$/, "").replace(/[._]+/g, " ");
+
+  // Detect TV Show pattern (e.g., S01E02 or S01)
+  const tvMatch = base.match(/^(.*?)\bS(\d{1,2})(?:E(\d{1,2}))?\b/i);
+  if (tvMatch && tvMatch[1].trim().length > 1) {
+    const cleanTv = tvMatch[1].replace(/\b(19\d{2}|20\d{2})\b.*/, "").replace(/[\(\[\-\–]+$/, "").trim();
+    const yearMatch = tvMatch[1].match(/\b(19\d{2}|20\d{2})\b/);
+    return {
+      query: cleanTv,
+      year: yearMatch ? yearMatch[1] : null,
+      isTv: true,
+      season: parseInt(tvMatch[2], 10),
+      episode: tvMatch[3] ? parseInt(tvMatch[3], 10) : null,
+    };
+  }
+
+  // Detect Movie pattern with Year (e.g., "Oppenheimer 2023 1080p...")
+  const yearMatch = base.match(/^(.*?)\b(19\d{2}|20\d{2})\b/);
+  if (yearMatch && yearMatch[1].trim().length > 1) {
+    return {
+      query: yearMatch[1].replace(/[\(\[\-\–]+$/, "").trim(),
+      year: yearMatch[2],
+      isTv: false,
+    };
+  }
+
+  // Fallback: strip common quality/codec tags
+  const stripped = base
+    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|web-?dl|webrip|hdrip|dvdrip|x264|x265|hevc|avc|10bit|hdr|aac|ddp?5\.?1|atmos|dual audio|hindi|english|esub)\b.*/i, "")
+    .replace(/[\(\[\-\–]+$/, "")
+    .trim();
+
+  return { query: stripped || base.slice(0, 60), year: null, isTv: false };
+}
+
+function extractMediaInfo(info, rawCaption) {
+  const f = info.file;
+  const sourceStr = `${info.name || ""} ${rawCaption || ""}`;
+
+  // Resolution
+  let res = null;
+  if (f.width && f.height) {
+    const h = Math.min(f.width, f.height);
+    const label = h >= 2160 ? "4K" : h >= 1080 ? "1080p" : h >= 720 ? "720p" : h >= 480 ? "480p" : `${h}p`;
+    res = `${f.width}×${f.height} (${label})`;
+  } else {
+    const m = sourceStr.match(/\b(2160p|1080p|720p|480p|360p|4K)\b/i);
+    if (m) res = m[1].toUpperCase();
+  }
+
+  // Duration
+  let duration = null;
+  if (f.duration) {
+    const hrs = Math.floor(f.duration / 3600);
+    const mins = Math.floor((f.duration % 3600) / 60);
+    const secs = f.duration % 60;
+    duration = hrs > 0 ? `${hrs}h ${mins}m ${secs}s` : `${mins}m ${secs}s`;
+  }
+
+  // Overall Bitrate (calculated from size & duration)
+  let bitrate = null;
+  if (f.file_size && f.duration && f.duration > 0) {
+    const kbps = Math.round((f.file_size * 8) / f.duration / 1000);
+    bitrate = kbps >= 1000 ? `${(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`;
+  }
+
+  // Video Codec & Color
+  const vCodecMatch = sourceStr.match(/\b(x264|x265|H\.?264|H\.?265|HEVC|AVC|AV1|VP9)\b/i);
+  const hdrMatch = sourceStr.match(/\b(HDR10\+?|Dolby\s*Vision|DV|10-?bit)\b/i);
+  const vParts = [];
+  if (vCodecMatch) vParts.push(vCodecMatch[1].toUpperCase());
+  if (hdrMatch) vParts.push(hdrMatch[1]);
+  const videoCodec = vParts.join(" · ") || null;
+
+  // Audio Codec & Channels
+  const aCodecMatch = sourceStr.match(/\b(AAC|AC3|EAC3|DDP|DD\+|DTS(?:-HD)?|TrueHD|Atmos|FLAC|MP3|Opus)\b/i);
+  const chanMatch = sourceStr.match(/\b(7\.1|5\.1|2\.0)\b/);
+  const aParts = [];
+  if (aCodecMatch) aParts.push(aCodecMatch[1].toUpperCase());
+  if (chanMatch) aParts.push(`${chanMatch[1]}ch`);
+  const audioCodec = aParts.join(" ") || null;
+
+  // Container format
+  const extMatch = (info.name || "").match(/\.([a-zA-Z0-9]{2,4})$/);
+  const container = extMatch ? extMatch[1].toUpperCase() : (f.mime_type ? f.mime_type.split("/")[1].toUpperCase() : null);
+
+  return { res, duration, bitrate, videoCodec, audioCodec, container };
+}
+
+async function fetchMovieMeta(env, rawTitle) {
+  const metaOn = (await getSetting(env, "meta_enabled")) === "1";
+  if (!metaOn) return null;
+
+  const explicitImdb = (rawTitle || "").match(/\b(tt\d{7,9})\b/i);
+  const parsed = parseMediaTitle(rawTitle);
+  if (!parsed.query && !explicitImdb) return null;
+
+  const tmdbKey = await getSetting(env, "tmdb_key");
+  const omdbKey = await getSetting(env, "omdb_key");
+
+  let result = {
+    title: null,
+    year: parsed.year,
+    rating: null,
+    genres: null,
+    plot: null,
+    poster: null,
+    imdbId: explicitImdb ? explicitImdb[1] : null,
+    tmdbId: null,
+    mediaType: parsed.isTv ? "tv" : "movie",
+    runtime: null,
+  };
+
+  // 1. TMDb Lookup
+  if (tmdbKey) {
+    try {
+      let item = null;
+      if (result.imdbId) {
+        const findUrl = `https://api.themoviedb.org/3/find/${result.imdbId}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`;
+        const findRes = await fetch(findUrl).then((r) => r.json());
+        item = (findRes.movie_results && findRes.movie_results[0]) || (findRes.tv_results && findRes.tv_results[0]);
+        if (findRes.tv_results && findRes.tv_results[0]) result.mediaType = "tv";
+      } else {
+        const type = parsed.isTv ? "tv" : "movie";
+        const yearParam = parsed.year ? (parsed.isTv ? `&first_air_date_year=${parsed.year}` : `&year=${parsed.year}`) : "";
+        const searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(parsed.query)}${yearParam}`;
+        const sRes = await fetch(searchUrl).then((r) => r.json());
+        item = sRes.results && sRes.results[0];
+      }
+
+      if (item) {
+        result.tmdbId = item.id;
+        result.title = item.title || item.name;
+        const dateStr = item.release_date || item.first_air_date || "";
+        if (dateStr) result.year = dateStr.slice(0, 4);
+        if (item.vote_average) result.rating = `⭐ ${Number(item.vote_average).toFixed(1)}/10 (TMDb)`;
+        if (item.overview) result.plot = item.overview;
+        if (item.poster_path) result.poster = `https://image.tmdb.org/t/p/w780${item.poster_path}`;
+
+        const detUrl = `https://api.themoviedb.org/3/${result.mediaType}/${item.id}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=external_ids`;
+        const det = await fetch(detUrl).then((r) => r.json());
+        if (det.genres && det.genres.length) {
+          result.genres = det.genres.slice(0, 3).map((g) => g.name).join(", ");
+        }
+        if (det.runtime) result.runtime = `${det.runtime} min`;
+        if (det.external_ids && det.external_ids.imdb_id) {
+          result.imdbId = det.external_ids.imdb_id;
+        }
+      }
+    } catch (err) {
+      console.log("TMDb lookup error:", err);
+    }
+  }
+
+  // 2. OMDb (IMDb) Lookup
+  if (omdbKey) {
+    try {
+      let omdbUrl = null;
+      if (result.imdbId) {
+        omdbUrl = `https://www.omdbapi.com/?apikey=${encodeURIComponent(omdbKey)}&i=${encodeURIComponent(result.imdbId)}`;
+      } else {
+        const yParam = parsed.year ? `&y=${encodeURIComponent(parsed.year)}` : "";
+        omdbUrl = `https://www.omdbapi.com/?apikey=${encodeURIComponent(omdbKey)}&t=${encodeURIComponent(parsed.query)}${yParam}`;
+      }
+      const omdb = await fetch(omdbUrl).then((r) => r.json());
+      if (omdb && omdb.Response === "True") {
+        if (!result.title) result.title = omdb.Title;
+        if (!result.year && omdb.Year) result.year = omdb.Year.slice(0, 4);
+        if (omdb.imdbID) result.imdbId = omdb.imdbID;
+        if (omdb.imdbRating && omdb.imdbRating !== "N/A") {
+          result.rating = `⭐ ${omdb.imdbRating}/10 (IMDb)`;
+        }
+        if (!result.genres && omdb.Genre && omdb.Genre !== "N/A") result.genres = omdb.Genre;
+        if (!result.plot && omdb.Plot && omdb.Plot !== "N/A") result.plot = omdb.Plot;
+        if (!result.runtime && omdb.Runtime && omdb.Runtime !== "N/A") result.runtime = omdb.Runtime;
+        if (!result.poster && omdb.Poster && omdb.Poster.startsWith("http")) result.poster = omdb.Poster;
+      }
+    } catch (err) {
+      console.log("OMDb lookup error:", err);
+    }
+  }
+
+  return result.title || result.rating || result.plot ? result : null;
+}
+
 // ---------- Handling new posts in channels ----------
 async function handleChannelPost(post, env) {
-  // Only react to channels saved as Source Channels
   const chatId = String(post.chat.id);
   const isSource = await env.DB.prepare(
     "SELECT 1 AS ok FROM channels WHERE role = 'source' AND chat_id = ?"
   ).bind(chatId).first();
   if (!isSource) return;
 
-  // In a group, only admins (or you) may add files
   if (post.chat.type !== "channel" && !(await isTrustedSender(env, post))) return;
 
   const info = classifyPost(post);
   if (!info) return;
 
-  // Find where to publish it
   const destRole = info.kind === "pdf" ? "pdfs" : "lectures";
   const dest = await getChannels(env, destRole);
   if (!dest.length) return;
@@ -2024,23 +2270,74 @@ async function handleChannelPost(post, env) {
     title,
     size: info.file.file_size || 0,
   });
-  if (!rowId) return; // already posted before
+  if (!rowId) return;
 
   const me = await tg(env, "getMe", {});
-  const emoji = info.kind === "pdf" ? "📄" : "🎓";
-  const label = info.kind === "pdf" ? "PDF" : "Lecture";
+  const emoji = info.kind === "pdf" ? "📄" : "🎬";
+  const label = info.kind === "pdf" ? "PDF" : "Video / Lecture";
 
-  const postText = `${emoji} <b>${esc(title.slice(0, 300))}</b>\n\n🏷 Type: ${label}\n📦 Size: ${formatSize(info.file.file_size)}`;
-  const markup = {
-    inline_keyboard: [[
-      { text: "📥 Get File", url: `https://t.me/${me.result.username}?start=f${rowId}` },
-    ]],
-  };
+  // 1. Fetch IMDb / TMDb metadata (only for video/lecture posts)
+  const meta = info.kind === "lecture" ? await fetchMovieMeta(env, `${post.caption || ""}\n${info.name}`) : null;
 
-  // Cover: your saved cover first, otherwise the file's own thumbnail
+  // 2. Extract MediaInfo (if enabled and video)
+  const miEnabled = (await getSetting(env, "mediainfo_enabled")) !== "0";
+  const mi = (info.kind === "lecture" && miEnabled) ? extractMediaInfo(info, post.caption) : null;
+
+  // 3. Format Caption
+  const displayTitle = meta && meta.title
+    ? `${meta.title}${meta.year ? ` (${meta.year})` : ""}`
+    : title.slice(0, 250);
+
+  const lines = [`${emoji} <b>${esc(displayTitle)}</b>`, ""];
+
+  if (meta) {
+    if (meta.rating) lines.push(`🏆 <b>Rating:</b> ${esc(meta.rating)}`);
+    if (meta.genres) lines.push(`🎭 <b>Genre:</b> ${esc(meta.genres)}`);
+    if (meta.runtime) lines.push(`⏱ <b>Runtime:</b> ${esc(meta.runtime)}`);
+  }
+
+  lines.push(`🏷 <b>Type:</b> ${label}`);
+  lines.push(`📦 <b>Size:</b> ${formatSize(info.file.file_size)}`);
+
+  if (mi) {
+    const tech = [];
+    if (mi.container) tech.push(mi.container);
+    if (mi.res) tech.push(mi.res);
+    if (mi.videoCodec) tech.push(mi.videoCodec);
+    if (mi.audioCodec) tech.push(mi.audioCodec);
+    if (mi.bitrate) tech.push(mi.bitrate);
+    if (mi.duration) tech.push(mi.duration);
+    if (tech.length) {
+      lines.push(`\n📊 <b>MediaInfo:</b>\n<code>${esc(tech.join(" | "))}</code>`);
+    }
+  }
+
+  if (meta && meta.plot) {
+    const shortPlot = meta.plot.length > 280 ? meta.plot.slice(0, 277) + "..." : meta.plot;
+    lines.push(`\n📝 <b>Plot:</b> <i>${esc(shortPlot)}</i>`);
+  }
+
+  const postText = lines.join("\n");
+
+  // 4. Build Inline Buttons (Get File + IMDb / TMDb links if found)
+  const keyboard = [[
+    { text: "📥 Get File", url: `https://t.me/${me.result.username}?start=f${rowId}` },
+  ]];
+  const extLinks = [];
+  if (meta && meta.imdbId) {
+    extLinks.push({ text: "⭐ IMDb", url: `https://www.imdb.com/title/${meta.imdbId}/` });
+  }
+  if (meta && meta.tmdbId) {
+    extLinks.push({ text: "🎬 TMDb", url: `https://www.themoviedb.org/${meta.mediaType}/${meta.tmdbId}` });
+  }
+  if (extLinks.length) keyboard.push(extLinks);
+
+  const markup = { inline_keyboard: keyboard };
+
+  // 5. Choose Cover Image: Saved custom cover -> TMDb/IMDb Poster -> Video Thumbnail
   const thumb = info.file.thumbnail || info.file.thumb;
-  const cover = (await getSetting(env, info.kind === "pdf" ? "cover_pdf" : "cover_lecture")) ||
-    (thumb ? thumb.file_id : null);
+  const savedCover = await getSetting(env, info.kind === "pdf" ? "cover_pdf" : "cover_lecture");
+  const cover = savedCover || (meta && meta.poster) || (thumb ? thumb.file_id : null);
 
   if (cover) {
     const sent = await tg(env, "sendPhoto", {
@@ -2053,6 +2350,7 @@ async function handleChannelPost(post, env) {
     if (sent.ok) return;
     console.log("Cover failed, posting without it:", JSON.stringify(sent));
   }
+
   const posted = await tg(env, "sendMessage", {
     chat_id: dest[0].chat_id,
     text: postText,
@@ -2060,7 +2358,6 @@ async function handleChannelPost(post, env) {
     reply_markup: markup,
   });
   if (!posted.ok) {
-    // Allow this file to be posted again later, and tell the owner why it failed
     await env.DB.prepare("DELETE FROM files WHERE id = ?").bind(rowId).run();
     await alertOwner(env, `post${dest[0].chat_id}`,
       `I couldn't post "${title}" to "${dest[0].title}": ${posted.description}. Check that I'm an admin there with the Post Messages permission, then upload the file again.`);
@@ -2068,7 +2365,6 @@ async function handleChannelPost(post, env) {
 }
 
 // ---------- Entry point ----------
-// Compares two texts without leaking how many characters matched
 function safeEqual(a, b) {
   if (!a || !b || a.length !== b.length) return false;
   let diff = 0;
@@ -2077,7 +2373,6 @@ function safeEqual(a, b) {
 }
 
 export default {
-  // Cron Trigger: runs every minute
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runCron(env));
   },
@@ -2086,7 +2381,6 @@ export default {
     const url = new URL(request.url);
     APP_ORIGIN = url.origin;
 
-    // Mini App page and its API
     if (request.method === "GET" && url.pathname === "/app") {
       return new Response(APP_HTML, {
         headers: {
