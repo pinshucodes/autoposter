@@ -1,17 +1,33 @@
-// Autoposter Bot - Step 8: /post, /broadcast, /stats
+// Autoposter Bot - Phase 1: security and reliability
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
 // Database binding: DB (set in wrangler.toml)
 
 // ---------- Talking to Telegram ----------
-async function tg(env, method, data) {
-  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  return res.json();
+async function tg(env, method, data, retried) {
+  let json;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    json = await res.json();
+  } catch (err) {
+    // Never let the bot token leak into logs or messages
+    const text = String(err).split(env.BOT_TOKEN).join("***");
+    return { ok: false, error_code: 0, description: text };
+  }
+  // Telegram says "slow down": wait a moment and try once more
+  if (!json.ok && json.error_code === 429 && !retried) {
+    const wait = (json.parameters && json.parameters.retry_after) || 1;
+    if (wait <= 2) {
+      await new Promise((r) => setTimeout(r, wait * 1000 + 100));
+      return tg(env, method, data, true);
+    }
+  }
+  return json;
 }
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -21,7 +37,7 @@ const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
 const ROLES = {
   source: {
     emoji: "📥", name: "Source Channels", multi: true,
-    help: "Channels where you upload your files. I watch these for new files.",
+    help: "Channels or groups where you upload your files. I watch these for new files. (For a group, make me an admin so I can see the files. Only group admins can add files.)",
   },
   lectures: {
     emoji: "🎓", name: "Lectures Channel", multi: false,
@@ -126,9 +142,24 @@ async function sendFileToUser(env, chatId, row) {
     caption: row.title,
   });
 
+  if (!sent.ok) {
+    console.log("Send file failed:", sent.error_code, sent.description);
+    if (sent.error_code !== 403) { // 403 = the user blocked the bot, nothing to tell them
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ I couldn't send the file right now. Please try again in a minute.",
+      });
+      await alertOwner(env, `send${row.id}`, `Could not send file #${row.id} "${row.title}": ${sent.description}`);
+    }
+    return false;
+  }
+
+  await env.DB.prepare("INSERT INTO downloads (user_id, file_row_id, day) VALUES (?, ?, ?)")
+    .bind(String(chatId), row.id, dayString(0)).run();
+
   // Auto-delete: warn the user and schedule removal
   const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
-  if (!sent.ok || !mins) return;
+  if (!mins) return true;
 
   const notice = await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -142,16 +173,26 @@ async function sendFileToUser(env, chatId, row) {
     await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
       .bind(String(chatId), id, deleteAt).run();
   }
+  return true;
 }
 
-// Runs every minute (Cron Trigger): deletes messages whose time is up
+// Runs every minute (Cron Trigger): deletes messages whose time is up, and retries if Telegram had a hiccup
 async function runDeletions(env, limit) {
   const due = await env.DB.prepare(
-    "SELECT id, chat_id, message_id FROM deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT ?"
+    "SELECT id, chat_id, message_id, attempts FROM deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT ?"
   ).bind(Date.now(), limit).all();
+
   for (const d of due.results || []) {
-    await tg(env, "deleteMessage", { chat_id: d.chat_id, message_id: d.message_id });
-    await env.DB.prepare("DELETE FROM deletions WHERE id = ?").bind(d.id).run();
+    const r = await tg(env, "deleteMessage", { chat_id: d.chat_id, message_id: d.message_id });
+    // Done, or Telegram says it can never work (already deleted, too old, user blocked me)
+    const finalAnswer = r.ok || r.error_code === 400 || r.error_code === 403;
+    if (finalAnswer || d.attempts >= 8) {
+      await env.DB.prepare("DELETE FROM deletions WHERE id = ?").bind(d.id).run();
+    } else {
+      // Temporary problem: try again soon, waiting a bit longer each time
+      await env.DB.prepare("UPDATE deletions SET attempts = attempts + 1, delete_at = ? WHERE id = ?")
+        .bind(Date.now() + (d.attempts + 1) * 60000, d.id).run();
+    }
   }
 }
 
@@ -200,7 +241,9 @@ async function sendVerifyLink(env, chatId, userId, row) {
   const me = await tg(env, "getMe", {});
   const short = await shortenUrl(env, `https://t.me/${me.result.username}?start=v${token}`);
   if (!short) {
-    // Shortener is down or misconfigured - don't leave the user stuck
+    // Shortener is down or misconfigured - don't leave the user stuck, but tell the owner
+    await alertOwner(env, "shortlink",
+      "The shortlink service isn't responding, or the API key is wrong. Users are getting files WITHOUT verification until it's fixed. Check /status.");
     await sendFileToUser(env, chatId, row);
     return;
   }
@@ -216,16 +259,38 @@ async function sendVerifyLink(env, chatId, userId, row) {
 // Returns the ForceSub channels this user has NOT joined yet
 async function getMissingChannels(env, userId) {
   const channels = await getChannels(env, "forcesub");
-  const missing = [];
-  for (const c of channels) {
+  const checks = await Promise.all(channels.map(async (c) => {
     const r = await tg(env, "getChatMember", { chat_id: c.chat_id, user_id: userId });
-    if (!r.ok) continue; // can't check (e.g. I lost admin) - don't block the user
+    if (!r.ok) {
+      if (/user not found|PARTICIPANT_ID_INVALID/i.test(r.description || "")) return c; // not joined
+      // I can't check this channel (maybe I lost admin). Don't lock users out, but warn the owner.
+      await alertOwner(env, `fs${c.chat_id}`,
+        `ForceSub can't check "${c.title}": ${r.description}. Make sure I'm still an admin there. Until then users are NOT being checked for that channel.`);
+      return null;
+    }
     const st = r.result.status;
     const joined = st === "member" || st === "administrator" || st === "creator" ||
       (st === "restricted" && r.result.is_member);
-    if (!joined) missing.push(c);
+    return joined ? null : c;
+  }));
+  return checks.filter(Boolean);
+}
+
+// Makes sure a ForceSub channel has a join link (older channels may not have one saved)
+async function ensureLink(env, c) {
+  if (c.link) return c.link;
+  const chat = await tg(env, "getChat", { chat_id: c.chat_id });
+  let link = chat.ok && chat.result.username ? `https://t.me/${chat.result.username}` : null;
+  if (!link) {
+    const inv = await tg(env, "exportChatInviteLink", { chat_id: c.chat_id });
+    if (inv.ok) link = inv.result;
   }
-  return missing;
+  if (link) {
+    await env.DB.prepare("UPDATE channels SET link = ? WHERE role = 'forcesub' AND chat_id = ?").bind(link, c.chat_id).run();
+  } else {
+    await alertOwner(env, `lnk${c.chat_id}`, `I have no join link for ForceSub channel "${c.title}". Give me the Invite Users permission there.`);
+  }
+  return link;
 }
 
 // Sends the file, or asks the user to join the channels first
@@ -239,7 +304,11 @@ async function deliverFile(env, chatId, userId, row, verified) {
     await sendFileToUser(env, chatId, row);
     return;
   }
-  const buttons = missing.map((c) => [{ text: `📢 Join ${c.title}`.slice(0, 60), url: c.link }]);
+  const buttons = [];
+  for (const c of missing) {
+    const link = await ensureLink(env, c);
+    if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
+  }
   buttons.push([{ text: "✅ I've Joined", callback_data: `chk:${row.id}` }]);
   await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -495,6 +564,7 @@ async function handleSettingInput(env, msg, field) {
 function extractChannelRef(msg) {
   const fo = msg.forward_origin;
   if (fo && fo.type === "channel") return fo.chat.id;
+  if (fo && fo.type === "chat" && fo.sender_chat) return fo.sender_chat.id;
   if (msg.forward_from_chat) return msg.forward_from_chat.id;
   const t = (msg.text || "").trim();
   if (/^-100\d+$/.test(t)) return t;
@@ -506,7 +576,10 @@ function extractChannelRef(msg) {
 async function checkChannel(env, ref, role) {
   const chat = await tg(env, "getChat", { chat_id: ref });
   if (!chat.ok) return { error: "I can't find that channel. Check the ID and make sure I'm added as an admin." };
-  if (chat.result.type !== "channel") return { error: "That's not a channel. Please send a channel." };
+  const isGroup = chat.result.type === "supergroup" || chat.result.type === "group";
+  if (chat.result.type !== "channel" && !(role === "source" && isGroup)) {
+    return { error: role === "source" ? "That's not a channel or group." : "That's not a channel. Please send a channel." };
+  }
 
   const me = await tg(env, "getMe", {});
   const member = await tg(env, "getChatMember", { chat_id: chat.result.id, user_id: me.result.id });
@@ -535,24 +608,34 @@ async function checkChannel(env, ref, role) {
 // Days (for stats) follow this time zone. 330 = India (IST). Change if you like.
 const TZ_OFFSET_MIN = 330;
 
+// Coming back from the shortlink faster than this = they skipped it
+const MIN_VERIFY_SECONDS = 8;
+
+// Rate limit: at most RATE_MAX actions per RATE_WINDOW_MS for each user
+const RATE_MAX = 8;
+const RATE_WINDOW_MS = 10000;
+
 function dayString(daysAgo) {
   const t = Date.now() + TZ_OFFSET_MIN * 60000 - daysAgo * 86400000;
   return new Date(t).toISOString().slice(0, 10);
 }
 
+// Saves the user and returns true if they are banned
 async function recordUser(env, from) {
-  await env.DB.prepare(
+  const r = await env.DB.prepare(
     "INSERT INTO users (user_id, first_name, joined_day, last_seen, active) VALUES (?, ?, ?, ?, 1) " +
-    "ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name, last_seen = excluded.last_seen, active = 1"
-  ).bind(String(from.id), from.first_name || "", dayString(0), Date.now()).run();
+    "ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name, last_seen = excluded.last_seen, active = 1 " +
+    "RETURNING banned"
+  ).bind(String(from.id), from.first_name || "", dayString(0), Date.now()).first();
+  return !!(r && r.banned);
 }
 
-// /post goes to these channels (not the Source channels)
+// Every channel I know, so /post can let you choose (max 30)
 async function getPostTargets(env) {
   const r = await env.DB.prepare(
-    "SELECT DISTINCT chat_id, title FROM channels WHERE role IN ('lectures', 'pdfs', 'forcesub')"
+    "SELECT chat_id, title, GROUP_CONCAT(role) AS roles FROM channels GROUP BY chat_id ORDER BY title, chat_id"
   ).all();
-  return r.results || [];
+  return (r.results || []).slice(0, 30);
 }
 
 async function countBroadcastUsers(env) {
@@ -560,35 +643,99 @@ async function countBroadcastUsers(env) {
   return r ? r.n : 0;
 }
 
-// Shows "are you sure?" after the owner sends the message for /post or /broadcast
+// ---------- Alerts to the owner ----------
+// Tells the owner about a problem, at most once per 30 minutes for each kind of problem
+async function alertOwner(env, key, text) {
+  try {
+    const last = parseInt((await getSetting(env, `alert_${key}`)) || "0", 10);
+    if (Date.now() - last < 30 * 60 * 1000) return;
+    await setSetting(env, `alert_${key}`, String(Date.now()));
+    await tg(env, "sendMessage", { chat_id: env.OWNER_ID, text: `🚨 ${text}` });
+  } catch (err) {
+    console.log("Alert failed:", err);
+  }
+}
+
+// ---------- Rate limit ----------
+// Returns true if this user is sending too fast and should be ignored
+async function isRateLimited(env, userId, chatId) {
+  const now = Date.now();
+  const r = await env.DB.prepare("SELECT window_start, count FROM rate WHERE user_id = ?").bind(String(userId)).first();
+  if (!r || now - r.window_start > RATE_WINDOW_MS) {
+    await env.DB.prepare("INSERT OR REPLACE INTO rate (user_id, window_start, count) VALUES (?, ?, 1)")
+      .bind(String(userId), now).run();
+    return false;
+  }
+  const count = r.count + 1;
+  await env.DB.prepare("UPDATE rate SET count = ? WHERE user_id = ?").bind(count, String(userId)).run();
+  if (count === RATE_MAX + 1) {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "⏳ You're going too fast. Please wait a few seconds." });
+    await alertOwner(env, `rl${userId}`, `User ${userId} is sending requests very fast. To block them: /ban ${userId}`);
+  }
+  return count > RATE_MAX;
+}
+
+// In a Source group, only admins (or you) may add files; otherwise anyone could post through me
+async function isTrustedSender(env, post) {
+  if (post.sender_chat && post.sender_chat.id === post.chat.id) return true; // admin posting anonymously
+  if (!post.from) return false;
+  if (String(post.from.id) === String(env.OWNER_ID)) return true;
+  const r = await tg(env, "getChatMember", { chat_id: post.chat.id, user_id: post.from.id });
+  return r.ok && (r.result.status === "creator" || r.result.status === "administrator");
+}
+
+// The /post channel picker
+function renderPicker(targets, mask, note) {
+  let text = "📣 <b>Choose where to post</b>\n\nTap a channel to switch it on or off, then tap Send.";
+  if (note) text += `\n\n${note}`;
+  const buttons = targets.map((c, i) => [{
+    text: `${mask & (1 << i) ? "✅" : "⬜"} ${c.title}`.slice(0, 60),
+    callback_data: `pk:t:${i}`,
+  }]);
+  buttons.push([
+    { text: "📤 Send", callback_data: "pk:go" },
+    { text: "✖️ Cancel", callback_data: "pk:no" },
+  ]);
+  return { text, buttons };
+}
+
+// After the owner sends the message for /post or /broadcast
 async function askConfirm(env, msg, kind) {
   const userId = String(msg.from.id);
   await clearState(env, userId);
 
-  let question;
   if (kind === "post") {
     const targets = await getPostTargets(env);
     if (!targets.length) {
       await tg(env, "sendMessage", {
         chat_id: msg.chat.id,
-        text: "You haven't added any Lectures, PDFs, or ForceSub channels yet. Add them in /settings first.",
+        text: "You haven't added any channels yet. Add them in /settings first.",
       });
       return;
     }
-    question = `📣 Post this message as it is to <b>${targets.length}</b> channel(s)?\n\n` +
-      targets.map((c) => `• ${esc(c.title)}`).join("\n");
-  } else {
-    question = `📢 Send this message to <b>${await countBroadcastUsers(env)}</b> users?`;
+    // Everything is switched on except channels that are only Source channels
+    let mask = 0;
+    targets.forEach((c, i) => { if (c.roles !== "source") mask |= 1 << i; });
+    await setState(env, userId, `pick:${msg.message_id}:${mask}`);
+    const view = renderPicker(targets, mask);
+    await tg(env, "sendMessage", {
+      chat_id: msg.chat.id,
+      text: view.text,
+      parse_mode: "HTML",
+      reply_to_message_id: msg.message_id,
+      reply_markup: { inline_keyboard: view.buttons },
+    });
+    return;
   }
 
   await tg(env, "sendMessage", {
     chat_id: msg.chat.id,
-    text: question,
+    text: `📢 Send this message to <b>${await countBroadcastUsers(env)}</b> users?`,
     parse_mode: "HTML",
     reply_to_message_id: msg.message_id,
     reply_markup: {
       inline_keyboard: [[
-        { text: "✅ Yes, send", callback_data: `pst:${kind}:${msg.message_id}` },
+        { text: "✅ Yes, send", callback_data: `pst:broadcast:${msg.message_id}` },
         { text: "✖️ Cancel", callback_data: "pst:no" },
       ]],
     },
@@ -600,88 +747,184 @@ async function processBroadcast(env, limit) {
   const job = await env.DB.prepare("SELECT * FROM broadcasts WHERE status = 'running' ORDER BY id LIMIT 1").first();
   if (!job) return;
 
+  // Short lock so two runs can never send to the same users at once
+  const now = Date.now();
+  const lock = await env.DB.prepare(
+    "UPDATE broadcasts SET locked_until = ? WHERE id = ? AND locked_until < ? AND status = 'running'"
+  ).bind(now + 55000, job.id, now).run();
+  if (!lock.meta.changes) return;
+
   const users = await env.DB.prepare(
     "SELECT rowid AS rid, user_id FROM users WHERE rowid > ? AND banned = 0 AND active = 1 ORDER BY rowid LIMIT ?"
   ).bind(job.last_rowid, limit).all();
   const list = users.results || [];
 
-  let sent = 0, failed = 0, last = job.last_rowid, rateLimited = false;
+  let sent = 0, failed = 0, last = job.last_rowid, backoff = 0;
   for (const u of list) {
     const r = await tg(env, "copyMessage", {
       chat_id: u.user_id, from_chat_id: job.from_chat, message_id: job.message_id,
     });
-    if (!r.ok && r.error_code === 429) { rateLimited = true; break; } // Telegram says slow down; retry next minute
+    if (!r.ok && r.error_code === 429) { // Telegram says slow down: pause and continue later
+      backoff = ((r.parameters && r.parameters.retry_after) || 5) * 1000;
+      break;
+    }
     if (r.ok) {
       sent++;
     } else {
       failed++;
-      if (r.error_code === 403) {
-        // The user blocked the bot - skip them in future broadcasts
+      if (r.error_code === 403) { // blocked the bot: skip them in future broadcasts
         await env.DB.prepare("UPDATE users SET active = 0 WHERE user_id = ?").bind(u.user_id).run();
       }
     }
     last = u.rid;
   }
 
-  const finished = !rateLimited && list.length < limit;
+  const finished = !backoff && list.length < limit;
   await env.DB.prepare(
-    "UPDATE broadcasts SET last_rowid = ?, sent = sent + ?, failed = failed + ?, status = ? WHERE id = ?"
-  ).bind(last, sent, failed, finished ? "done" : "running", job.id).run();
+    "UPDATE broadcasts SET last_rowid = ?, sent = sent + ?, failed = failed + ?, locked_until = ?, " +
+    "status = CASE WHEN status = 'running' AND ? = 1 THEN 'done' ELSE status END WHERE id = ?"
+  ).bind(last, sent, failed, backoff ? Date.now() + backoff : 0, finished ? 1 : 0, job.id).run();
 
   if (finished) {
-    await tg(env, "sendMessage", {
-      chat_id: job.owner_chat,
-      text: `✅ Broadcast finished.\nDelivered: ${job.sent + sent}\nFailed: ${job.failed + failed}`,
-    });
+    const after = await env.DB.prepare("SELECT status FROM broadcasts WHERE id = ?").bind(job.id).first();
+    if (after && after.status === "done") {
+      await tg(env, "sendMessage", {
+        chat_id: job.owner_chat,
+        text: `✅ Broadcast finished.\nDelivered: ${job.sent + sent}\nFailed: ${job.failed + failed}`,
+      });
+    }
   }
 }
 
 // Runs every minute. Deletions and broadcasts share Cloudflare's free request limit per run.
 async function runCron(env) {
-  const job = await env.DB.prepare("SELECT 1 AS x FROM broadcasts WHERE status = 'running' LIMIT 1").first();
-  await runDeletions(env, job ? 15 : 40);
-  if (job) await processBroadcast(env, 30);
+  try {
+    await setSetting(env, "last_cron", String(Date.now()));
+    const job = await env.DB.prepare("SELECT 1 AS x FROM broadcasts WHERE status = 'running' LIMIT 1").first();
+    await runDeletions(env, job ? 15 : 40);
+    if (job) await processBroadcast(env, 30);
+  } catch (err) {
+    console.log("Cron error:", err);
+    await alertOwner(env, "cron", `The scheduled cleanup job hit an error: ${String(err).slice(0, 300)}`);
+  }
 }
 
 async function sendStats(env, chatId) {
   const today = dayString(0);
-  const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
-  const active = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE active = 1").first();
-  const joined = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE joined_day = ?").bind(today).first();
-  const ver = await env.DB.prepare(
-    "SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM verifications WHERE day = ?"
-  ).bind(today).first();
-  const files = await env.DB.prepare("SELECT COUNT(*) AS n FROM files").first();
-  const week = await env.DB.prepare(
-    "SELECT day, COUNT(*) AS n FROM verifications WHERE day >= ? GROUP BY day"
-  ).bind(dayString(6)).all();
+  const one = (sql, ...args) => env.DB.prepare(sql).bind(...args).first();
 
-  const counts = {};
-  for (const r of week.results || []) counts[r.day] = r.n;
+  const total = await one("SELECT COUNT(*) AS n FROM users");
+  const active = await one("SELECT COUNT(*) AS n FROM users WHERE active = 1 AND banned = 0");
+  const banned = await one("SELECT COUNT(*) AS n FROM users WHERE banned = 1");
+  const joined = await one("SELECT COUNT(*) AS n FROM users WHERE joined_day = ?", today);
+  const ver = await one("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM verifications WHERE day = ?", today);
+  const dl = await one("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM downloads WHERE day = ?", today);
+  const files = await one("SELECT COUNT(*) AS n FROM files");
+
+  const since = dayString(6);
+  const vWeek = await env.DB.prepare("SELECT day, COUNT(*) AS n FROM verifications WHERE day >= ? GROUP BY day").bind(since).all();
+  const dWeek = await env.DB.prepare("SELECT day, COUNT(*) AS n FROM downloads WHERE day >= ? GROUP BY day").bind(since).all();
+  const v = {}, d = {};
+  for (const r of vWeek.results || []) v[r.day] = r.n;
+  for (const r of dWeek.results || []) d[r.day] = r.n;
   const lines = [];
   for (let i = 0; i < 7; i++) {
-    const d = dayString(i);
-    lines.push(`${d}: ${counts[d] || 0}`);
+    const day = dayString(i);
+    lines.push(`${day}: ${v[day] || 0} verified · ${d[day] || 0} delivered`);
   }
 
   const text =
     "📊 <b>Stats</b>\n\n" +
-    `👥 Users: <b>${total.n}</b> (${active.n} active)\n` +
+    `👥 Users: <b>${total.n}</b> (${active.n} reachable, ${banned.n} banned)\n` +
     `🆕 Joined today: <b>${joined.n}</b>\n` +
     `✅ Verifications today: <b>${ver.n}</b> (${ver.u} people)\n` +
+    `📥 Files delivered today: <b>${dl.n}</b> (${dl.u} people)\n` +
     `📁 Files posted: <b>${files.n}</b>\n\n` +
-    "📅 <b>Verifications, last 7 days</b>\n" + lines.join("\n") +
+    "📅 <b>Last 7 days</b>\n" + lines.join("\n") +
     "\n\n<i>Days follow India time (IST).</i>";
   await tg(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
 }
 
+// /status: is everything healthy?
+async function sendStatus(env, chatId) {
+  const lines = [];
+
+  // Telegram connection
+  const hook = await tg(env, "getWebhookInfo", {});
+  if (hook.ok) {
+    const h = hook.result;
+    lines.push(`${h.url ? "✅" : "⚠️"} Webhook: ${h.url ? "set" : "NOT set"}, waiting updates: ${h.pending_update_count}`);
+    if (h.last_error_message) {
+      const when = h.last_error_date ? new Date(h.last_error_date * 1000).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "";
+      lines.push(`⚠️ Last Telegram delivery error: ${esc(h.last_error_message)} ${when}`);
+    }
+  } else {
+    lines.push(`⚠️ Can't reach Telegram: ${esc(hook.description || "unknown error")}`);
+  }
+
+  // Scheduled job
+  const lc = parseInt((await getSetting(env, "last_cron")) || "0", 10);
+  const age = lc ? Math.round((Date.now() - lc) / 60000) : null;
+  lines.push(age === null ? "⚠️ Cleanup job: hasn't run yet"
+    : age <= 3 ? `✅ Cleanup job: ran ${age} min ago`
+    : `⚠️ Cleanup job: last ran ${age} min ago (check the cron trigger)`);
+
+  // Queues
+  const q = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(delete_at <= ?) AS due FROM deletions").bind(Date.now()).first();
+  lines.push(`🗑 Deletions waiting: ${q.n} (${q.due || 0} due now)`);
+  const job = await env.DB.prepare("SELECT * FROM broadcasts WHERE status = 'running' LIMIT 1").first();
+  if (job) lines.push(`📢 Broadcast running: ${job.sent + job.failed} of ${job.total} done`);
+
+  // Shortlink
+  if ((await getSetting(env, "shortlink_enabled")) === "1") {
+    const test = await shortenUrl(env, "https://t.me/telegram");
+    lines.push(test ? "✅ Shortlink: working" : "⚠️ Shortlink: NOT working (users skip verification)");
+  } else {
+    lines.push("➖ Shortlink: off");
+  }
+  const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
+  lines.push(`➖ Auto-delete: ${formatDelay(mins)}`);
+
+  // Channels: am I still an admin?
+  const me = await tg(env, "getMe", {});
+  const chans = await env.DB.prepare(
+    "SELECT chat_id, title, GROUP_CONCAT(role) AS roles FROM channels GROUP BY chat_id ORDER BY title LIMIT 10"
+  ).all();
+  const rows = await Promise.all((chans.results || []).map(async (c) => {
+    const r = me.ok ? await tg(env, "getChatMember", { chat_id: c.chat_id, user_id: me.result.id }) : null;
+    let mark = "✅", note = "";
+    if (!r || !r.ok || r.result.status !== "administrator") { mark = "⚠️"; note = " - I'm not an admin there"; }
+    else if (r.result.can_post_messages === false && /lectures|pdfs/.test(c.roles)) { mark = "⚠️"; note = " - I can't post there"; }
+    return `${mark} ${esc(c.title)} (${esc(c.roles)})${note}`;
+  }));
+  if (rows.length) lines.push("\n<b>Channels</b>\n" + rows.join("\n"));
+
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "🩺 <b>Status</b>\n\n" + lines.join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
 // ---------- Handling messages ----------
 async function handleMessage(msg, env) {
+  // Files posted in a Source group (anything that isn't a private chat with the bot)
+  if (msg.chat.type !== "private") {
+    await handleChannelPost(msg, env);
+    return;
+  }
+  if (!msg.from) return;
+
   const text = msg.text || "";
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
   const isOwner = userId === String(env.OWNER_ID);
-  if (msg.chat.type === "private") await recordUser(env, msg.from);
+
+  const banned = await recordUser(env, msg.from);
+  if (!isOwner) {
+    if (banned) return;
+    if (await isRateLimited(env, userId, chatId)) return;
+  }
 
   if (text.startsWith("/start")) {
     // Coming back from the shortlink: /start v<token>
@@ -698,7 +941,17 @@ async function handleMessage(msg, env) {
         });
         return;
       }
-      await env.DB.prepare("DELETE FROM tokens WHERE token = ?").bind(tok[1]).run();
+      // Back too fast = they skipped the shortlink. Keep the token so they can still do it properly.
+      if (Date.now() - t.created < MIN_VERIFY_SECONDS * 1000) {
+        await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: "⚠️ Verification not completed. Please finish the steps on the link first, then come back.",
+        });
+        return;
+      }
+      // The token works once, even if two taps arrive together
+      const used = await env.DB.prepare("DELETE FROM tokens WHERE token = ?").bind(tok[1]).run();
+      if (!used.meta.changes) return;
       await env.DB.prepare("INSERT INTO verifications (user_id, file_row_id, day) VALUES (?, ?, ?)")
         .bind(userId, t.file_row_id, dayString(0)).run();
       const row = await getFileRow(env, t.file_row_id);
@@ -729,6 +982,37 @@ async function handleMessage(msg, env) {
   }
 
   if (!isOwner) return;
+
+  if (text.startsWith("/status")) {
+    await clearState(env, userId);
+    await sendStatus(env, chatId);
+    return;
+  }
+
+  if (/^\/(ban|unban)(\s|$)/.test(text)) {
+    const unban = text.startsWith("/unban");
+    const target = text.split(/\s+/)[1] || "";
+    if (!/^\d{5,15}$/.test(target)) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "Use it like this: /ban 123456789 (or /unban 123456789)" });
+      return;
+    }
+    if (target === String(env.OWNER_ID)) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "You can't ban yourself." });
+      return;
+    }
+    await env.DB.prepare(
+      "INSERT INTO users (user_id, first_name, joined_day, last_seen, banned, active) VALUES (?, '', ?, 0, ?, 0) " +
+      "ON CONFLICT(user_id) DO UPDATE SET banned = excluded.banned"
+    ).bind(target, dayString(0), unban ? 0 : 1).run();
+    await tg(env, "sendMessage", { chat_id: chatId, text: `${unban ? "✅ Unbanned" : "🚫 Banned"} user ${target}.` });
+    return;
+  }
+
+  if (text.startsWith("/stopbroadcast")) {
+    const r = await env.DB.prepare("UPDATE broadcasts SET status = 'cancelled' WHERE status = 'running'").run();
+    await tg(env, "sendMessage", { chat_id: chatId, text: r.meta.changes ? "🛑 Broadcast stopped." : "No broadcast is running." });
+    return;
+  }
 
   if (text.startsWith("/stats")) {
     await clearState(env, userId);
@@ -812,6 +1096,10 @@ async function handleMessage(msg, env) {
 
 // ---------- Handling button taps ----------
 async function handleButton(query, env) {
+  if (!query.message || !query.data) {
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+    return;
+  }
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const userId = String(query.from.id);
@@ -820,6 +1108,13 @@ async function handleButton(query, env) {
 
   // "I've Joined" button - anyone can use this one
   if (action === "chk") {
+    if (userId !== String(env.OWNER_ID)) {
+      const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
+      if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+        return;
+      }
+    }
     const row = await getFileRow(env, Number(parts[1]));
     if (!row) {
       await tg(env, "answerCallbackQuery", {
@@ -893,7 +1188,7 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Confirm buttons for /post and /broadcast: pst:post:<msgid>, pst:broadcast:<msgid>, pst:no
+  // /broadcast confirm: pst:broadcast:<msgid>, pst:no
   if (action === "pst") {
     const edit = (text) => tg(env, "editMessageText", {
       chat_id: chatId, message_id: messageId, text, parse_mode: "HTML",
@@ -902,37 +1197,70 @@ async function handleButton(query, env) {
       await edit("Cancelled.");
       return;
     }
-    const srcMsg = Number(parts[2]);
-
-    if (parts[1] === "post") {
-      const targets = await getPostTargets(env);
-      let ok = 0;
-      const failed = [];
-      for (const c of targets) {
-        const r = await tg(env, "copyMessage", { chat_id: c.chat_id, from_chat_id: chatId, message_id: srcMsg });
-        if (r.ok) ok++; else failed.push(c.title);
-      }
-      let text = `✅ Posted to ${ok} of ${targets.length} channel(s).`;
-      if (failed.length) {
-        text += `\n\n⚠️ Failed: ${failed.map(esc).join(", ")}\nCheck that I'm an admin there with the Post Messages permission.`;
-      }
-      await edit(text);
-      return;
-    }
-
     if (parts[1] === "broadcast") {
+      const srcMsg = Number(parts[2]);
       const running = await env.DB.prepare("SELECT 1 AS x FROM broadcasts WHERE status = 'running' LIMIT 1").first();
       if (running) {
-        await edit("⚠️ A broadcast is already running. Please wait for it to finish.");
+        await edit("⚠️ A broadcast is already running. Please wait for it to finish, or send /stopbroadcast.");
         return;
       }
       const total = await countBroadcastUsers(env);
       await env.DB.prepare(
         "INSERT INTO broadcasts (from_chat, message_id, owner_chat, total) VALUES (?, ?, ?, ?)"
       ).bind(String(chatId), srcMsg, String(chatId), total).run();
-      await edit(`📢 Broadcast started for <b>${total}</b> users. I'll message you when it's finished.`);
+      await edit(`📢 Broadcast started for <b>${total}</b> users. I'll message you when it's finished. (/stopbroadcast cancels it.)`);
       await processBroadcast(env, 35);
+    }
+    return;
+  }
+
+  // /post channel picker: pk:t:<index>, pk:go, pk:no
+  if (action === "pk") {
+    const edit = (text, markup) => tg(env, "editMessageText", {
+      chat_id: chatId, message_id: messageId, text, parse_mode: "HTML", reply_markup: markup,
+    });
+    if (parts[1] === "no") {
+      await clearState(env, userId);
+      await edit("Cancelled.");
       return;
+    }
+    const st = (await getState(env, userId)) || "";
+    const m = st.match(/^pick:(\d+):(\d+)$/);
+    if (!m) {
+      await edit("This /post session has expired. Send /post again.");
+      return;
+    }
+    const srcMsg = Number(m[1]);
+    let mask = Number(m[2]);
+    const targets = await getPostTargets(env);
+
+    if (parts[1] === "t") {
+      mask ^= 1 << Number(parts[2]);
+      await setState(env, userId, `pick:${srcMsg}:${mask}`);
+      const view = renderPicker(targets, mask);
+      await edit(view.text, { inline_keyboard: view.buttons });
+      return;
+    }
+
+    if (parts[1] === "go") {
+      const chosen = targets.filter((c, i) => mask & (1 << i));
+      if (!chosen.length) {
+        const view = renderPicker(targets, mask, "⚠️ Choose at least one channel.");
+        await edit(view.text, { inline_keyboard: view.buttons });
+        return;
+      }
+      let ok = 0;
+      const failed = [];
+      for (const c of chosen) {
+        const r = await tg(env, "copyMessage", { chat_id: c.chat_id, from_chat_id: chatId, message_id: srcMsg });
+        if (r.ok) ok++; else failed.push(c.title);
+      }
+      await clearState(env, userId);
+      let text = `✅ Posted to ${ok} of ${chosen.length} channel(s).`;
+      if (failed.length) {
+        text += `\n\n⚠️ Failed: ${failed.map(esc).join(", ")}\nCheck that I'm an admin there with the Post Messages permission.`;
+      }
+      await edit(text);
     }
     return;
   }
@@ -1036,6 +1364,9 @@ async function handleChannelPost(post, env) {
   ).bind(chatId).first();
   if (!isSource) return;
 
+  // In a group, only admins (or you) may add files
+  if (post.chat.type !== "channel" && !(await isTrustedSender(env, post))) return;
+
   const info = classifyPost(post);
   if (!info) return;
 
@@ -1082,15 +1413,29 @@ async function handleChannelPost(post, env) {
     if (sent.ok) return;
     console.log("Cover failed, posting without it:", JSON.stringify(sent));
   }
-  await tg(env, "sendMessage", {
+  const posted = await tg(env, "sendMessage", {
     chat_id: dest[0].chat_id,
     text: postText,
     parse_mode: "HTML",
     reply_markup: markup,
   });
+  if (!posted.ok) {
+    // Allow this file to be posted again later, and tell the owner why it failed
+    await env.DB.prepare("DELETE FROM files WHERE id = ?").bind(rowId).run();
+    await alertOwner(env, `post${dest[0].chat_id}`,
+      `I couldn't post "${title}" to "${dest[0].title}": ${posted.description}. Check that I'm an admin there with the Post Messages permission, then upload the file again.`);
+  }
 }
 
 // ---------- Entry point ----------
+// Compares two texts without leaking how many characters matched
+function safeEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 export default {
   // Cron Trigger: runs every minute
   async scheduled(event, env, ctx) {
@@ -1102,17 +1447,25 @@ export default {
       return new Response("Autoposter bot is running ✅");
     }
     const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-    if (secret !== env.WEBHOOK_SECRET) {
+    if (!safeEqual(secret, env.WEBHOOK_SECRET)) {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    const update = await request.json();
+    let update;
+    try {
+      update = await request.json();
+    } catch (err) {
+      return new Response("Bad request", { status: 400 });
+    }
+
     try {
       if (update.message) await handleMessage(update.message, env);
       if (update.callback_query) await handleButton(update.callback_query, env);
       if (update.channel_post) await handleChannelPost(update.channel_post, env);
     } catch (err) {
-      console.log("Error:", err);
+      const detail = String(err && err.stack ? err.stack : err).split(env.BOT_TOKEN).join("***");
+      console.log("Error:", detail);
+      await alertOwner(env, "error", `Something went wrong in the bot: ${detail.slice(0, 300)}`);
     }
     return new Response("OK");
   },
