@@ -1,4 +1,4 @@
-// Autoposter Bot - Phase 1: security and reliability
+// Autoposter Bot - Phase 1 (security and reliability) + Mini App payments (UPI)
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -297,7 +297,7 @@ async function ensureLink(env, c) {
 async function deliverFile(env, chatId, userId, row, verified) {
   const missing = await getMissingChannels(env, userId);
   if (!missing.length) {
-    if (!verified && (await shortlinkReady(env))) {
+    if (!verified && (await shortlinkReady(env)) && !(await hasActiveSub(env, userId))) {
       await sendVerifyLink(env, chatId, userId, row);
       return;
     }
@@ -329,6 +329,7 @@ const MAIN_MENU = {
     [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "del:menu" }],
     [{ text: "🖼️ Cover Images", callback_data: "cov:menu" }],
+    [{ text: "💳 Payments", callback_data: "pay:menu" }],
     [{ text: "❌ Close", callback_data: "close" }],
   ],
 };
@@ -504,6 +505,32 @@ async function handleSettingInput(env, msg, field) {
       text: cmenu.text,
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: cmenu.buttons },
+    });
+    return;
+  }
+
+  if (field === "upi_id" || field === "upi_name") {
+    const v = (msg.text || "").trim();
+    const valid = field === "upi_id"
+      ? /^[A-Za-z0-9._-]{2,64}@[A-Za-z][A-Za-z0-9]{1,30}$/.test(v)
+      : v.length >= 2 && v.length <= 40 && !/[&?=#%<>]/.test(v);
+    if (!valid) {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: field === "upi_id"
+          ? "That doesn't look like a UPI ID. It should look like name@bank. Try again, or /cancel."
+          : "Please send a short name (2 to 40 letters, no special symbols), or /cancel.",
+      });
+      return;
+    }
+    await setSetting(env, field, v);
+    await clearState(env, userId);
+    const pmenu = await buildPayMenu(env, "✅ Saved.");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: pmenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: pmenu.buttons },
     });
     return;
   }
@@ -820,6 +847,7 @@ async function sendStats(env, chatId) {
   const ver = await one("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM verifications WHERE day = ?", today);
   const dl = await one("SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM downloads WHERE day = ?", today);
   const files = await one("SELECT COUNT(*) AS n FROM files");
+  const subs = await one("SELECT COUNT(*) AS n FROM subscriptions WHERE expires_at > ?", Date.now());
 
   const since = dayString(6);
   const vWeek = await env.DB.prepare("SELECT day, COUNT(*) AS n FROM verifications WHERE day >= ? GROUP BY day").bind(since).all();
@@ -839,7 +867,8 @@ async function sendStats(env, chatId) {
     `🆕 Joined today: <b>${joined.n}</b>\n` +
     `✅ Verifications today: <b>${ver.n}</b> (${ver.u} people)\n` +
     `📥 Files delivered today: <b>${dl.n}</b> (${dl.u} people)\n` +
-    `📁 Files posted: <b>${files.n}</b>\n\n` +
+    `📁 Files posted: <b>${files.n}</b>\n` +
+    `⭐ Active subscribers: <b>${subs.n}</b>\n\n` +
     "📅 <b>Last 7 days</b>\n" + lines.join("\n") +
     "\n\n<i>Days follow India time (IST).</i>";
   await tg(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
@@ -884,6 +913,9 @@ async function sendStatus(env, chatId) {
   }
   const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
   lines.push(`➖ Auto-delete: ${formatDelay(mins)}`);
+  const upiId = await getSetting(env, "upi_id");
+  const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE status = 'submitted'").first();
+  lines.push(upiId ? `✅ Payments: UPI set, ${waiting.n} waiting for your approval` : "➖ Payments: UPI ID not set");
 
   // Channels: am I still an admin?
   const me = await tg(env, "getMe", {});
@@ -905,6 +937,351 @@ async function sendStatus(env, chatId) {
     parse_mode: "HTML",
   });
 }
+
+// ---------- Subscriptions (skip ads) ----------
+const PLANS = {
+  week: { name: "1 Week", price: 20, days: 7 },
+  month: { name: "1 Month", price: 60, days: 30 },
+  two: { name: "2 Months", price: 100, days: 60 },
+  year: { name: "1 Year", price: 500, days: 365 },
+};
+
+let APP_ORIGIN = null; // this Worker's web address, learned from incoming requests
+
+function fmtDate(ms) {
+  return new Date(ms + TZ_OFFSET_MIN * 60000).toISOString().slice(0, 10);
+}
+
+// Returns the expiry time if the user has an active plan, otherwise 0. Checked at every delivery.
+async function getSubExpiry(env, userId) {
+  const r = await env.DB.prepare("SELECT expires_at FROM subscriptions WHERE user_id = ?").bind(String(userId)).first();
+  return r && r.expires_at > Date.now() ? r.expires_at : 0;
+}
+
+async function hasActiveSub(env, userId) {
+  return (await getSubExpiry(env, userId)) > 0;
+}
+
+// Adds the plan's days on top of whatever time the user still has left
+async function activateSubscription(env, userId, planKey) {
+  const cur = await env.DB.prepare("SELECT expires_at FROM subscriptions WHERE user_id = ?").bind(String(userId)).first();
+  const start = Math.max(Date.now(), cur ? cur.expires_at : 0);
+  const expires = start + PLANS[planKey].days * 86400000;
+  await env.DB.prepare("INSERT OR REPLACE INTO subscriptions (user_id, expires_at, plan) VALUES (?, ?, ?)")
+    .bind(String(userId), expires, planKey).run();
+  return expires;
+}
+
+// ---------- Mini App security: proves the request really comes from this Telegram user ----------
+async function hmacSha256(key, data) {
+  const k = await crypto.subtle.importKey(
+    "raw", typeof key === "string" ? new TextEncoder().encode(key) : key,
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(data)));
+}
+
+// Returns the Telegram user if the Mini App data is genuine and fresh (under 24 hours), otherwise null
+async function verifyInitData(env, initData) {
+  if (!initData || initData.length > 4096) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get("hash");
+  if (!hash) return null;
+  params.delete("hash");
+  const check = [...params.entries()].map(([k, v]) => `${k}=${v}`).sort().join("\n");
+  const secret = await hmacSha256("WebAppData", env.BOT_TOKEN);
+  const sig = [...(await hmacSha256(secret, check))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (!safeEqual(sig, hash)) return null;
+  if (Date.now() / 1000 - Number(params.get("auth_date") || 0) > 86400) return null;
+  try {
+    const user = JSON.parse(params.get("user"));
+    return user && Number.isInteger(user.id) ? user : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+// ---------- Mini App API ----------
+async function handleApi(request, env, path) {
+  if (request.method !== "POST") return json({ error: "Not allowed" }, 405);
+  const user = await verifyInitData(env, request.headers.get("X-Init-Data") || "");
+  if (!user) return json({ error: "auth" }, 401);
+  const uid = String(user.id);
+
+  const ban = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(uid).first();
+  if (ban && ban.banned) return json({ error: "Your account can't use this." }, 403);
+
+  let body = {};
+  try { body = await request.json(); } catch (err) { /* empty body is fine */ }
+
+  const upiId = await getSetting(env, "upi_id");
+
+  if (path === "/api/me") {
+    const until = await getSubExpiry(env, uid);
+    const w = await env.DB.prepare(
+      "SELECT id, plan, amount FROM payments WHERE user_id = ? AND status = 'submitted' ORDER BY id DESC LIMIT 1"
+    ).bind(uid).first();
+    return json({
+      premium_until: until ? fmtDate(until) : null,
+      upi_ready: !!upiId,
+      plans: Object.entries(PLANS).map(([key, p]) => ({ key, name: p.name, price: p.price, days: p.days })),
+      waiting: w ? { plan_name: PLANS[w.plan].name, amount: w.amount } : null,
+    });
+  }
+
+  if (path === "/api/pay") {
+    if (!upiId) return json({ error: "Payments aren't set up yet." }, 400);
+    const plan = PLANS[body.plan];
+    if (!plan) return json({ error: "Unknown plan." }, 400);
+    // The price always comes from the server, never from the app
+    const recent = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE user_id = ? AND created > ?")
+      .bind(uid, Date.now() - 3600000).first();
+    if (recent.n >= 8) return json({ error: "Too many attempts. Please try again in a while." }, 429);
+
+    const ins = await env.DB.prepare(
+      "INSERT INTO payments (user_id, plan, amount, status, created) VALUES (?, ?, ?, 'pending', ?)"
+    ).bind(uid, body.plan, plan.price, Date.now()).run();
+    const payee = (await getSetting(env, "upi_name")) || "Premium";
+    const link = `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payee)}` +
+      `&am=${plan.price}.00&cu=INR&tn=${encodeURIComponent("Premium " + plan.name)}`;
+    return json({ id: ins.meta.last_row_id, plan: plan.name, amount: plan.price, upi_id: upiId, payee, link });
+  }
+
+  if (path === "/api/utr") {
+    const utr = String(body.utr || "").trim();
+    if (!/^[0-9]{12}$/.test(utr)) return json({ error: "The reference number (UTR) is 12 digits. Please check and try again." }, 400);
+    const pay = await env.DB.prepare("SELECT * FROM payments WHERE id = ? AND user_id = ?").bind(Number(body.id), uid).first();
+    if (!pay || pay.status !== "pending") return json({ error: "This payment can't be updated." }, 400);
+    try {
+      const upd = await env.DB.prepare("UPDATE payments SET utr = ?, status = 'submitted' WHERE id = ? AND status = 'pending'")
+        .bind(utr, pay.id).run();
+      if (!upd.meta.changes) return json({ error: "This payment can't be updated." }, 400);
+    } catch (err) {
+      // The same reference number can't be used for two payments
+      return json({ error: "This reference number was already used." }, 400);
+    }
+    const plan = PLANS[pay.plan];
+    await tg(env, "sendMessage", {
+      chat_id: env.OWNER_ID,
+      text: `💳 <b>Payment to approve</b>\n\nUser: <code>${esc(uid)}</code> ${esc(user.first_name || "")}\nPlan: ${esc(plan.name)} (₹${plan.price})\nUTR: <code>${esc(utr)}</code>\n\nCheck your bank or UPI app for ₹${plan.price} with this reference number before approving.`,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Approve", callback_data: `pay:ok:${pay.id}` },
+          { text: "❌ Reject", callback_data: `pay:no:${pay.id}` },
+        ]],
+      },
+    });
+    return json({ ok: true });
+  }
+
+  return json({ error: "Not found" }, 404);
+}
+
+// ---------- /skipads and the payments settings ----------
+async function sendSkipAds(env, chatId, userId) {
+  if (!APP_ORIGIN) {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "Premium isn't available yet. Please try again later." });
+    return;
+  }
+  const until = await getSubExpiry(env, userId);
+  const plans = Object.values(PLANS).map((p) => `• ${p.name}: ₹${p.price}`).join("\n");
+  const text = until
+    ? `⭐ <b>Premium is active</b> until ${fmtDate(until)}.\n\nYou can add more time any time:\n${plans}`
+    : `⭐ <b>Skip the ads</b>\n\nGet your files instantly, with no verification step.\n\n${plans}`;
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{ text: "⭐ Choose a plan", web_app: { url: `${APP_ORIGIN}/app` } }]] },
+  });
+}
+
+async function buildPayMenu(env, note) {
+  const upi = await getSetting(env, "upi_id");
+  const name = await getSetting(env, "upi_name");
+  const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE status = 'submitted'").first();
+  let text = "💳 <b>Payments (UPI)</b>\n\n" +
+    "Customers pay your UPI ID from the Mini App, then send their reference number (UTR). " +
+    "You approve each payment after checking your bank or UPI app.\n\n" +
+    `UPI ID: ${upi ? `<code>${esc(upi)}</code>` : "<i>not set</i>"}\n` +
+    `Payee name: ${name ? esc(name) : "<i>not set (shows Premium)</i>"}\n` +
+    `Waiting for approval: ${waiting.n}\n\n<b>Plans</b>\n` +
+    Object.values(PLANS).map((p) => `${p.name}: ₹${p.price}`).join("\n");
+  if (note) text += `\n\n${note}`;
+  const buttons = [
+    [{ text: "🆔 Set UPI ID", callback_data: "pay:upi" }],
+    [{ text: "📝 Set Payee Name", callback_data: "pay:name" }],
+    ...BACK_BUTTON,
+  ];
+  return { text, buttons };
+}
+
+// ---------- The Mini App page ----------
+const APP_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Skip Ads</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#fff);--text:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#707579);--accent:var(--tg-theme-button-color,#2481cc);--accent-text:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#f1f3f5)}
+*{box-sizing:border-box}
+body{margin:0;padding:16px 16px calc(28px + env(safe-area-inset-bottom,0px));background:var(--bg);color:var(--text);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+h1{font-size:22px;margin:4px 0}
+.sub{color:var(--hint);margin:4px 0 14px;font-size:15px}
+.card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:12px}
+.plan{display:flex;justify-content:space-between;align-items:center;width:100%;border:0;color:var(--text);font:inherit;text-align:left;cursor:pointer}
+.plan b{font-size:18px}
+.btn{display:block;width:100%;padding:13px;border:0;border-radius:12px;background:var(--accent);color:var(--accent-text);font:inherit;font-weight:600;text-align:center;text-decoration:none;cursor:pointer;margin-top:10px}
+.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+.big{font-size:30px;font-weight:700;margin:2px 0}
+.mono{font-family:ui-monospace,Menlo,monospace;word-break:break-all}
+input{width:100%;padding:13px;border-radius:12px;border:1px solid var(--hint);background:var(--bg);color:var(--text);font:inherit;font-size:18px;letter-spacing:1px}
+.err{color:#d93025;margin-top:8px;min-height:20px;font-size:14px}
+ol{padding-left:20px;margin:6px 0 12px;color:var(--hint);font-size:15px}
+</style></head>
+<body><div id="root"></div>
+<script>
+var tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+var root = document.getElementById("root");
+
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+function clear() { while (root.firstChild) root.removeChild(root.firstChild); }
+function api(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Init-Data": tg ? tg.initData : "" },
+    body: JSON.stringify(body || {})
+  }).then(function (r) { return r.json(); })
+    .catch(function () { return { error: "Network problem. Please try again." }; });
+}
+function fail(text) {
+  clear();
+  root.appendChild(el("h1", null, "Something went wrong"));
+  root.appendChild(el("p", "sub", text === "auth" ? "Please open this page from the bot's /skipads button." : text));
+  var b = el("button", "btn", "Try again");
+  b.onclick = load;
+  root.appendChild(b);
+}
+function load() {
+  clear();
+  root.appendChild(el("p", "sub", "Loading..."));
+  api("/api/me").then(function (me) {
+    if (me.error) return fail(me.error);
+    home(me);
+  });
+}
+function home(me) {
+  clear();
+  root.appendChild(el("h1", null, "\\u2B50 Skip the ads"));
+  root.appendChild(el("p", "sub", "Get your files instantly, with no verification step."));
+  var st = el("div", "card");
+  if (me.premium_until) {
+    st.appendChild(el("b", null, "Premium active"));
+    st.appendChild(el("div", "sub", "Until " + me.premium_until + ". Buying again adds time on top."));
+  } else {
+    st.appendChild(el("b", null, "No active plan"));
+  }
+  root.appendChild(st);
+  if (me.waiting) {
+    var w = el("div", "card");
+    w.appendChild(el("b", null, "Payment waiting for approval"));
+    w.appendChild(el("div", "sub", me.waiting.plan_name + " - Rs " + me.waiting.amount + ". You'll get a message in the bot as soon as it's approved."));
+    var r = el("button", "btn ghost", "Refresh");
+    r.onclick = load;
+    w.appendChild(r);
+    root.appendChild(w);
+  }
+  if (!me.upi_ready) {
+    root.appendChild(el("p", "sub", "Payments aren't set up yet. Please try again later."));
+    return;
+  }
+  me.plans.forEach(function (p) {
+    var b = el("button", "card plan");
+    b.appendChild(el("span", null, p.name));
+    b.appendChild(el("b", null, "Rs " + p.price));
+    b.onclick = function () { startPay(p); };
+    root.appendChild(b);
+  });
+}
+function startPay(p) {
+  api("/api/pay", { plan: p.key }).then(function (d) {
+    if (d.error) return fail(d.error);
+    pay(d);
+  });
+}
+function pay(d) {
+  clear();
+  root.appendChild(el("h1", null, d.plan));
+  var c = el("div", "card");
+  c.appendChild(el("div", "sub", "Pay exactly"));
+  c.appendChild(el("div", "big", "Rs " + d.amount));
+  c.appendChild(el("div", "sub", "to this UPI ID (" + d.payee + ")"));
+  c.appendChild(el("div", "mono", d.upi_id));
+  var copy = el("button", "btn ghost", "Copy UPI ID");
+  copy.onclick = function () {
+    if (navigator.clipboard) navigator.clipboard.writeText(d.upi_id);
+    copy.textContent = "Copied";
+  };
+  c.appendChild(copy);
+  var open = el("a", "btn", "Open UPI app");
+  open.href = d.link;
+  c.appendChild(open);
+  root.appendChild(c);
+
+  var steps = el("ol");
+  ["Pay the amount above in any UPI app.", "Find the 12-digit reference number (UTR) in your payment details.", "Enter it below and submit."].forEach(function (t) {
+    steps.appendChild(el("li", null, t));
+  });
+  root.appendChild(steps);
+
+  var input = el("input");
+  input.type = "text";
+  input.inputMode = "numeric";
+  input.maxLength = 12;
+  input.placeholder = "12-digit UTR number";
+  root.appendChild(input);
+  var err = el("div", "err");
+  root.appendChild(err);
+  var go = el("button", "btn", "I've paid - submit");
+  go.onclick = function () {
+    go.disabled = true;
+    err.textContent = "";
+    api("/api/utr", { id: d.id, utr: input.value }).then(function (res) {
+      go.disabled = false;
+      if (res.error) { err.textContent = res.error; return; }
+      done();
+    });
+  };
+  root.appendChild(go);
+  var back = el("button", "btn ghost", "Back");
+  back.onclick = load;
+  root.appendChild(back);
+}
+function done() {
+  clear();
+  root.appendChild(el("h1", null, "Thank you!"));
+  root.appendChild(el("p", "sub", "Your payment is being checked. You'll get a message in the bot as soon as Premium is active."));
+  var b = el("button", "btn", "Close");
+  b.onclick = function () { if (tg) tg.close(); else load(); };
+  root.appendChild(b);
+}
+load();
+</script></body></html>`;
 
 // ---------- Handling messages ----------
 async function handleMessage(msg, env) {
@@ -981,7 +1358,31 @@ async function handleMessage(msg, env) {
     return;
   }
 
+  if (/^\/(skipads|premium)(\s|@|$)/.test(text)) {
+    await sendSkipAds(env, chatId, userId);
+    return;
+  }
+
   if (!isOwner) return;
+
+  if (/^\/grant(\s|$)/.test(text)) {
+    const [, target, planKey] = text.split(/\s+/);
+    if (!/^\d{5,15}$/.test(target || "") || !PLANS[planKey]) {
+      await tg(env, "sendMessage", { chat_id: chatId, text: "Use it like this: /grant 123456789 month\nPlans: week, month, two, year" });
+      return;
+    }
+    const exp = await activateSubscription(env, target, planKey);
+    await tg(env, "sendMessage", { chat_id: chatId, text: `✅ Premium for ${target} until ${fmtDate(exp)}.` });
+    await tg(env, "sendMessage", { chat_id: target, text: `⭐ Premium activated until ${fmtDate(exp)}. Enjoy ad-free downloads!` });
+    return;
+  }
+
+  if (/^\/revoke(\s|$)/.test(text)) {
+    const target = text.split(/\s+/)[1] || "";
+    const r = await env.DB.prepare("DELETE FROM subscriptions WHERE user_id = ?").bind(target).run();
+    await tg(env, "sendMessage", { chat_id: chatId, text: r.meta.changes ? `Premium removed for ${target}.` : "That user has no premium plan." });
+    return;
+  }
 
   if (text.startsWith("/status")) {
     await clearState(env, userId);
@@ -1311,6 +1712,52 @@ async function handleButton(query, env) {
     return;
   }
 
+  // Payments: pay:menu, pay:upi, pay:name, pay:ok:<id>, pay:no:<id>
+  if (action === "pay") {
+    const sub = parts[1];
+    if (sub === "upi" || sub === "name") {
+      await setState(env, userId, `set:upi_${sub === "upi" ? "id" : "name"}`);
+      await tg(env, "editMessageText", {
+        chat_id: chatId,
+        message_id: messageId,
+        text: sub === "upi"
+          ? "💳 Send your UPI ID, like <code>name@bank</code>. Customers will pay to this ID."
+          : "💳 Send the name to show on payments, like <code>My Classes</code>.",
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "pay:menu" }]] },
+      });
+      return;
+    }
+    if (sub === "ok" || sub === "no") {
+      const id = Number(parts[2]);
+      const pay = await env.DB.prepare("SELECT * FROM payments WHERE id = ?").bind(id).first();
+      const edit = (text) => tg(env, "editMessageText", { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" });
+      if (!pay) { await edit("Payment not found."); return; }
+      const approve = sub === "ok";
+      // Only a payment that is still waiting can be decided, and only once
+      const upd = await env.DB.prepare("UPDATE payments SET status = ?, decided = ? WHERE id = ? AND status = 'submitted'")
+        .bind(approve ? "approved" : "rejected", Date.now(), id).run();
+      if (!upd.meta.changes) { await edit(`This payment was already ${esc(pay.status)}.`); return; }
+      const plan = PLANS[pay.plan];
+      if (approve) {
+        const exp = await activateSubscription(env, pay.user_id, pay.plan);
+        await tg(env, "sendMessage", { chat_id: pay.user_id, text: `✅ Payment approved! Premium is active until ${fmtDate(exp)}. Enjoy ad-free downloads.` });
+        await edit(`✅ Approved: user ${esc(pay.user_id)}, ${esc(plan.name)} (₹${plan.price}). Premium until ${fmtDate(exp)}.`);
+      } else {
+        await tg(env, "sendMessage", { chat_id: pay.user_id, text: "❌ We couldn't confirm your payment. If you paid, please contact the admin with your payment screenshot." });
+        await edit(`❌ Rejected: user ${esc(pay.user_id)}, ${esc(plan.name)} (₹${plan.price}).`);
+      }
+      return;
+    }
+    await clearState(env, userId);
+    const pm = await buildPayMenu(env);
+    await tg(env, "editMessageText", {
+      chat_id: chatId, message_id: messageId, text: pm.text, parse_mode: "HTML",
+      reply_markup: { inline_keyboard: pm.buttons },
+    });
+    return;
+  }
+
   // Shortlink settings: sl:menu, sl:toggle, sl:domain, sl:key
   if (action === "sl") {
     const sub = parts[1];
@@ -1443,6 +1890,28 @@ export default {
   },
 
   async fetch(request, env) {
+    const url = new URL(request.url);
+    APP_ORIGIN = url.origin;
+
+    // Mini App page and its API
+    if (request.method === "GET" && url.pathname === "/app") {
+      return new Response(APP_HTML, {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
+    if (url.pathname.startsWith("/api/")) {
+      try {
+        return await handleApi(request, env, url.pathname);
+      } catch (err) {
+        console.log("API error:", String(err).split(env.BOT_TOKEN).join("***"));
+        return json({ error: "Server problem. Please try again." }, 500);
+      }
+    }
+
     if (request.method !== "POST") {
       return new Response("Autoposter bot is running ✅");
     }
