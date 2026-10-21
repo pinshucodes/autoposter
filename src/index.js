@@ -2794,17 +2794,15 @@ async function handleChannelPost(post, env) {
     return;
   }
 
-  // 2. Handle Movies & TV Series Episodes
-  const targets = await getChannels(env, "lectures");
+  // 2. Handle Movies & TV Series Episodes (up to 50 channels)
+  const targets = (await getChannels(env, "lectures")).slice(0, 50);
   if (!targets.length) return;
-  const targetChat = targets[0].chat_id;
 
   await ensureExtraTables(env);
   const parsed = parseMediaFilename(info.name, post.caption || "");
   const groupOn = (await getSetting(env, "group_qualities")) !== "0";
   const showMediaInfo = (await getSetting(env, "mediainfo_enabled")) !== "0";
 
-  // Check if we already have an existing channel post for this Movie or Series Season
   const existingPost = groupOn
     ? await env.DB.prepare("SELECT * FROM media_posts WHERE group_key = ?").bind(parsed.groupKey).first()
     : null;
@@ -2848,14 +2846,12 @@ async function handleChannelPost(post, env) {
   };
 
   if (parsed.isSeries) {
-    // Replace if same quality + same episode, otherwise add
     const idx = items.findIndex((x) =>
       x.rowId === rowId || (parsed.episode && x.quality === parsed.quality && x.episode === parsed.episode)
     );
     if (idx >= 0) items[idx] = newItem;
     else items.push(newItem);
   } else {
-    // Movie: replace if same quality already uploaded, otherwise add new quality button
     const idx = items.findIndex((x) => x.quality === parsed.quality);
     if (idx >= 0) items[idx] = newItem;
     else items.push(newItem);
@@ -2863,62 +2859,103 @@ async function handleChannelPost(post, env) {
 
   const view = await buildChannelPostView(env, meta, parsed, items, showMediaInfo);
 
-  // If the channel post already exists, edit its caption & buttons in place!
-  if (existingPost && existingPost.message_id && String(existingPost.chat_id) === String(targetChat)) {
-    const editMethod = existingPost.has_photo ? "editMessageCaption" : "editMessageText";
-    const editPayload = {
-      chat_id: targetChat,
-      message_id: existingPost.message_id,
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: view.buttons },
-    };
-    if (existingPost.has_photo) editPayload.caption = view.caption;
-    else editPayload.text = view.caption;
-
-    const edited = await tg(env, editMethod, editPayload);
-    if (edited.ok || /message is not modified/i.test(edited.description || "")) {
-      await env.DB.prepare(
-        "UPDATE media_posts SET items_json = ?, updated = ? WHERE group_key = ?"
-      ).bind(JSON.stringify(items), Date.now(), parsed.groupKey).run();
-      return;
+  const chanMap = {};
+  if (groupOn) {
+    const chRows = await env.DB.prepare(
+      "SELECT chat_id, message_id, has_photo FROM media_post_channels WHERE group_key = ?"
+    ).bind(parsed.groupKey).all();
+    for (const r of chRows.results || []) {
+      chanMap[String(r.chat_id)] = { message_id: r.message_id, has_photo: r.has_photo };
+    }
+    if (existingPost && existingPost.chat_id && existingPost.message_id && !chanMap[String(existingPost.chat_id)]) {
+      chanMap[String(existingPost.chat_id)] = {
+        message_id: existingPost.message_id,
+        has_photo: existingPost.has_photo,
+      };
     }
   }
 
-  // Otherwise publish a brand-new post to the Movies/Series Channel
   const fallbackCover = await getSetting(env, "cover_lecture");
-  const photoSource = (meta && meta.poster) || fallbackCover || null;
-  let sent = null;
-  let hasPhoto = 0;
+  let photoSource = (meta && meta.poster) || fallbackCover || null;
+  let firstMsgId = existingPost ? existingPost.message_id : 0;
+  let firstChatId = existingPost ? existingPost.chat_id : "";
+  let firstHasPhoto = existingPost ? existingPost.has_photo : 0;
+  let anySuccess = false;
 
-  if (photoSource) {
-    sent = await tg(env, "sendPhoto", {
-      chat_id: targetChat,
-      photo: photoSource,
-      caption: view.caption,
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: view.buttons },
-    });
-    if (sent.ok) hasPhoto = 1;
+  for (const t of targets) {
+    const targetChat = String(t.chat_id);
+    const prev = chanMap[targetChat];
+
+    if (groupOn && prev && prev.message_id) {
+      const editMethod = prev.has_photo ? "editMessageCaption" : "editMessageText";
+      const editPayload = {
+        chat_id: targetChat,
+        message_id: prev.message_id,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: view.buttons },
+      };
+      if (prev.has_photo) editPayload.caption = view.caption;
+      else editPayload.text = view.caption;
+
+      const edited = await tg(env, editMethod, editPayload);
+      if (edited.ok || /message is not modified/i.test(edited.description || "")) {
+        anySuccess = true;
+        continue;
+      }
+    }
+
+    let sent = null;
+    let hasPhoto = 0;
+
+    if (photoSource) {
+      sent = await tg(env, "sendPhoto", {
+        chat_id: targetChat,
+        photo: photoSource,
+        caption: view.caption,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: view.buttons },
+      });
+      if (sent.ok) {
+        hasPhoto = 1;
+        if (sent.result.photo && sent.result.photo.length) {
+          photoSource = sent.result.photo[sent.result.photo.length - 1].file_id;
+        }
+      }
+    }
+
+    if (!sent || !sent.ok) {
+      sent = await tg(env, "sendMessage", {
+        chat_id: targetChat,
+        text: view.caption,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: view.buttons },
+      });
+    }
+
+    if (sent && sent.ok) {
+      anySuccess = true;
+      if (!firstMsgId) {
+        firstMsgId = sent.result.message_id;
+        firstChatId = targetChat;
+        firstHasPhoto = hasPhoto;
+      }
+      if (groupOn) {
+        await env.DB.prepare(
+          "INSERT OR REPLACE INTO media_post_channels (group_key, chat_id, message_id, has_photo) VALUES (?, ?, ?, ?)"
+        ).bind(parsed.groupKey, targetChat, sent.result.message_id, hasPhoto).run();
+      }
+    }
   }
 
-  if (!sent || !sent.ok) {
-    sent = await tg(env, "sendMessage", {
-      chat_id: targetChat,
-      text: view.caption,
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: view.buttons },
-    });
-  }
-
-  if (sent && sent.ok && groupOn) {
+  if (anySuccess && groupOn) {
     await env.DB.prepare(
       "INSERT OR REPLACE INTO media_posts (group_key, chat_id, message_id, has_photo, meta_json, items_json, updated) " +
       "VALUES (?, ?, ?, ?, ?, ?, ?)"
     ).bind(
       parsed.groupKey,
-      String(targetChat),
-      sent.result.message_id,
-      hasPhoto,
+      String(firstChatId),
+      firstMsgId,
+      firstHasPhoto,
       JSON.stringify(meta),
       JSON.stringify(items),
       Date.now()
