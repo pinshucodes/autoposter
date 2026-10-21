@@ -80,7 +80,7 @@ const ROLES = {
     help: "Channels or groups where you upload your files. I watch these for new files. (For a group, make me an admin so I can see the files. Only group admins can add files.)",
   },
   lectures: {
-    emoji: "🎬", name: "Movies / Series Channel", multi: false,
+    emoji: "🎬", name: "Movies / Series Channel", multi: true, max: 50,
     help: "The main channel where movie and series posts will be published and auto-updated.",
   },
   pdfs: {
