@@ -2053,14 +2053,24 @@ async function handleButton(query, env) {
   const parts = query.data.split(":");
   const action = parts[0];
 
-  // User tapped an Episode button or "Send All Episodes" inside a Series Batch Menu
-  if (action === "bep" || action === "ball") {
+  // User tapped a File button, NEXT/PREVIOUS page, or Send All inside the DM File Menu
+  if (action === "bep" || action === "ball" || action === "bpage") {
     if (userId !== String(env.OWNER_ID)) {
       const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
       if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
         await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
         return;
       }
+    }
+    if (action === "bpage") {
+      const batch = await getBatchRow(env, Number(parts[1]));
+      if (!batch) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Menu expired.", show_alert: true });
+        return;
+      }
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+      await sendBatchMenuToUser(env, chatId, batch, Number(parts[2]) || 0, messageId);
+      return;
     }
     if (action === "bep") {
       const row = await getFileRow(env, Number(parts[1]));
