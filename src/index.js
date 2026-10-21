@@ -517,8 +517,10 @@ async function buildRoleMenu(env, role) {
   const buttons = channels.map((c) => [
     { text: `🗑 Remove ${c.title}`.slice(0, 60), callback_data: `rm:${role}:${c.chat_id}` },
   ]);
-  const addLabel = info.multi ? "➕ Add Channel" : channels.length ? "🔄 Change Channel" : "➕ Set Channel";
-  buttons.push([{ text: addLabel, callback_data: `add:${role}` }]);
+  if (!info.max || channels.length < info.max) {
+    const addLabel = info.multi ? "➕ Add Channel" : channels.length ? "🔄 Change Channel" : "➕ Set Channel";
+    buttons.push([{ text: addLabel, callback_data: `add:${role}` }]);
+  }
   buttons.push(...BACK_BUTTON);
 
   return { text, buttons };
