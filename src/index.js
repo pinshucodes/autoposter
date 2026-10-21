@@ -1417,6 +1417,17 @@ var descEl = document.getElementById("desc");
 var btnEl = document.getElementById("go");
 var errEl = document.getElementById("err");
 
+function launchShortlink(rawUrl) {
+  var u = String(rawUrl || "").trim();
+  if (!/^https?:\/\//i.test(u)) u = "https://" + u.replace(/^\/+/, "");
+  if (tg && typeof tg.openLink === "function") {
+    tg.openLink(u, { try_instant_view: false });
+    setTimeout(function() { try { tg.close(); } catch (e) {} }, 350);
+  } else {
+    window.open(u, "_blank", "noopener,noreferrer");
+  }
+}
+
 if (!tg || !tg.initData) {
   titleEl.textContent = "🚫 Access Denied";
   descEl.textContent = "This verification link can only be opened directly inside the official Telegram app. External browsers and bypass tools are blocked.";
@@ -1436,9 +1447,8 @@ if (!tg || !tg.initData) {
     btnEl.style.display = "block";
     btnEl.onclick = function() {
       btnEl.disabled = true;
-      location.replace(d.url);
+      launchShortlink(d.url);
     };
-    setTimeout(function() { location.replace(d.url); }, 600);
   }).catch(function() {
     errEl.textContent = "Network error. Please close and try again.";
   });
@@ -1605,7 +1615,7 @@ function load() {
 }
 function home(me) {
   clear();
-  root.appendChild(el("h1", null, "\\u2B50 Skip the ads"));
+  root.appendChild(el("h1", null, "⭐ Skip the ads"));
   root.appendChild(el("p", "sub", "Get your files instantly, with no verification step."));
   var st = el("div", "card");
   if (me.premium_until) {
@@ -1631,7 +1641,7 @@ function home(me) {
   me.plans.forEach(function (p) {
     var b = el("button", "card plan");
     b.appendChild(el("span", null, p.name));
-    b.appendChild(el("b", null, me.upi_ready ? "Rs " + p.price : "\\u2B50 " + p.stars));
+    b.appendChild(el("b", null, me.upi_ready ? "Rs " + p.price : "⭐ " + p.stars));
     b.onclick = function () { choose(p); };
     root.appendChild(b);
   });
@@ -1648,7 +1658,7 @@ function methods(p) {
   var u = el("button", "btn", "Pay with UPI - Rs " + p.price);
   u.onclick = function () { startPay(p); };
   root.appendChild(u);
-  var st = el("button", "btn", "Pay with Stars - \\u2B50 " + p.stars);
+  var st = el("button", "btn", "Pay with Stars - ⭐ " + p.stars);
   st.onclick = function () { startStars(p); };
   root.appendChild(st);
   var back = el("button", "btn ghost", "Back");
