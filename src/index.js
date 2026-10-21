@@ -1,4 +1,4 @@
-// Autoposter Bot - Phase 1 (security and reliability) + Mini App payments (UPI) + IMDb/TMDb/MediaInfo
+// Autoposter Bot - Multi-Quality Movie Grouping + Deep MediaInfo + Anti-Copyright Shield
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -15,11 +15,9 @@ async function tg(env, method, data, retried) {
     });
     json = await res.json();
   } catch (err) {
-    // Never let the bot token leak into logs or messages
     const text = String(err).split(env.BOT_TOKEN).join("***");
     return { ok: false, error_code: 0, description: text };
   }
-  // Telegram says "slow down": wait a moment and try once more
   if (!json.ok && json.error_code === 429 && !retried) {
     const wait = (json.parameters && json.parameters.retry_after) || 1;
     if (wait <= 2) {
@@ -32,16 +30,36 @@ async function tg(env, method, data, retried) {
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+// ---------- Auto-create new table for Multi-Quality Grouped Posts ----------
+let SCHEMA_READY = false;
+async function ensureExtraTables(env) {
+  if (SCHEMA_READY) return;
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS media_posts (" +
+      "group_key TEXT PRIMARY KEY, " +
+      "chat_id TEXT, " +
+      "message_id INTEGER, " +
+      "has_photo INTEGER, " +
+      "meta_json TEXT, " +
+      "items_json TEXT, " +
+      "updated INTEGER)"
+    ).run();
+    SCHEMA_READY = true;
+  } catch (err) {
+    console.log("Table init note:", err);
+  }
+}
+
 // ---------- Channel settings we manage ----------
-// multi = can have many channels (true) or just one (false)
 const ROLES = {
   source: {
     emoji: "📥", name: "Source Channels", multi: true,
     help: "Channels or groups where you upload your files. I watch these for new files. (For a group, make me an admin so I can see the files. Only group admins can add files.)",
   },
   lectures: {
-    emoji: "🎓", name: "Lectures Channel", multi: false,
-    help: "The channel where lecture/video posts will be published.",
+    emoji: "🎬", name: "Movies / Videos Channel", multi: false,
+    help: "The main channel where video/movie posts will be published and auto-updated with new qualities.",
   },
   pdfs: {
     emoji: "📄", name: "PDFs Channel", multi: false,
@@ -90,11 +108,12 @@ async function clearState(env, userId) {
 
 // ---------- Files we have seen in source channels ----------
 async function saveFile(env, f) {
-  // Returns the new row id, or null if we already saw this exact file
   const r = await env.DB.prepare(
     "INSERT OR IGNORE INTO files (file_id, file_unique_id, kind, send_as, title, size) VALUES (?, ?, ?, ?, ?, ?)"
   ).bind(f.file_id, f.file_unique_id, f.kind, f.send_as, f.title, f.size).run();
-  return r.meta.changes > 0 ? r.meta.last_row_id : null;
+  if (r.meta.changes > 0) return r.meta.last_row_id;
+  const ex = await env.DB.prepare("SELECT id FROM files WHERE file_unique_id = ?").bind(f.file_unique_id).first();
+  return ex ? ex.id : null;
 }
 
 async function getFileRow(env, id) {
@@ -104,10 +123,9 @@ async function getFileRow(env, id) {
 function formatSize(bytes) {
   if (!bytes) return "Unknown";
   const mb = bytes / (1024 * 1024);
-  return mb >= 1024 ? (mb / 1024).toFixed(2) + " GB" : mb.toFixed(1) + " MB";
+  return mb >= 1024 ? (mb / 1024).toFixed(2) + " GB" : mb.toFixed(0) + " MB";
 }
 
-// Decides if a post is a lecture (video) or a PDF. Anything else is ignored.
 function classifyPost(post) {
   if (post.video) {
     return { kind: "lecture", send_as: "video", file: post.video, name: post.video.file_name || "" };
@@ -119,14 +137,13 @@ function classifyPost(post) {
     if (mime === "application/pdf" || /\.pdf$/i.test(name)) {
       return { kind: "pdf", send_as: "document", file: d, name };
     }
-    if (mime.startsWith("video/") || /\.(mkv|mp4|avi|mov|webm|flv|m4v)$/i.test(name)) {
+    if (mime.startsWith("video/") || /\.(mkv|mp4|avi|mov|webm|flv|m4v|ts)$/i.test(name)) {
       return { kind: "lecture", send_as: "document", file: d, name };
     }
   }
   return null;
 }
 
-// Title = first line of the caption, otherwise the file name without extension
 function makeTitle(post, name) {
   const caption = (post.caption || "").split("\n")[0].trim();
   if (caption) return caption;
@@ -134,17 +151,43 @@ function makeTitle(post, name) {
   return cleaned || "Untitled";
 }
 
+// Cache bot username so we don't call getMe repeatedly
+let CACHED_BOT_USERNAME = null;
+async function getBotUsername(env) {
+  if (CACHED_BOT_USERNAME) return CACHED_BOT_USERNAME;
+  const me = await tg(env, "getMe", {});
+  if (me.ok && me.result.username) {
+    CACHED_BOT_USERNAME = me.result.username;
+    await setSetting(env, "bot_username", CACHED_BOT_USERNAME);
+    return CACHED_BOT_USERNAME;
+  }
+  return (await getSetting(env, "bot_username")) || "";
+}
+
+// Generates a copyright-safe link that routes through your Worker if enabled
+async function makeDeepLink(env, startParam) {
+  const shieldOn = (await getSetting(env, "shield_redirect")) !== "0"; // ON by default
+  if (shieldOn && APP_ORIGIN) {
+    return `${APP_ORIGIN}/get/${startParam}`;
+  }
+  const username = await getBotUsername(env);
+  return `https://t.me/${username}?start=${startParam}`;
+}
+
 async function sendFileToUser(env, chatId, row) {
   const asVideo = row.send_as === "video";
+  const protect = (await getSetting(env, "protect_files")) === "1";
   const sent = await tg(env, asVideo ? "sendVideo" : "sendDocument", {
     chat_id: chatId,
     [asVideo ? "video" : "document"]: row.file_id,
-    caption: row.title,
+    caption: `🎬 <b>${esc(row.title)}</b>`,
+    parse_mode: "HTML",
+    protect_content: protect,
   });
 
   if (!sent.ok) {
     console.log("Send file failed:", sent.error_code, sent.description);
-    if (sent.error_code !== 403) { // 403 = the user blocked the bot, nothing to tell them
+    if (sent.error_code !== 403) {
       await tg(env, "sendMessage", {
         chat_id: chatId,
         text: "⚠️ I couldn't send the file right now. Please try again in a minute.",
@@ -157,13 +200,14 @@ async function sendFileToUser(env, chatId, row) {
   await env.DB.prepare("INSERT INTO downloads (user_id, file_row_id, day) VALUES (?, ?, ?)")
     .bind(String(chatId), row.id, dayString(0)).run();
 
-  // Auto-delete: warn the user and schedule removal
-  const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
+  // Auto-delete: default to 10 minutes if not set so copyright bots can't scan chat history
+  const rawMins = await getSetting(env, "delete_minutes");
+  const mins = rawMins === null ? 10 : parseInt(rawMins, 10);
   if (!mins) return true;
 
   const notice = await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `⚠️ This file will be deleted in <b>${formatDelay(mins)}</b>. Forward it or save it somewhere now.`,
+    text: `⏳ <b>Auto-Delete Notice:</b> Due to copyright protection, this file will be deleted here in <b>${formatDelay(mins)}</b>.${protect ? "" : " Please forward or save it immediately."}`,
     parse_mode: "HTML",
   });
   const deleteAt = Date.now() + mins * 60 * 1000;
@@ -176,7 +220,7 @@ async function sendFileToUser(env, chatId, row) {
   return true;
 }
 
-// Runs every minute (Cron Trigger): deletes messages whose time is up, and retries if Telegram had a hiccup
+// Runs every minute (Cron Trigger)
 async function runDeletions(env, limit) {
   const due = await env.DB.prepare(
     "SELECT id, chat_id, message_id, attempts FROM deletions WHERE delete_at <= ? ORDER BY delete_at LIMIT ?"
@@ -184,12 +228,10 @@ async function runDeletions(env, limit) {
 
   for (const d of due.results || []) {
     const r = await tg(env, "deleteMessage", { chat_id: d.chat_id, message_id: d.message_id });
-    // Done, or Telegram says it can never work (already deleted, too old, user blocked me)
     const finalAnswer = r.ok || r.error_code === 400 || r.error_code === 403;
     if (finalAnswer || d.attempts >= 8) {
       await env.DB.prepare("DELETE FROM deletions WHERE id = ?").bind(d.id).run();
     } else {
-      // Temporary problem: try again soon, waiting a bit longer each time
       await env.DB.prepare("UPDATE deletions SET attempts = attempts + 1, delete_at = ? WHERE id = ?")
         .bind(Date.now() + (d.attempts + 1) * 60000, d.id).run();
     }
@@ -214,7 +256,6 @@ async function shortlinkReady(env) {
   return on === "1" && !!domain && !!key;
 }
 
-// Works with most shortener sites that use the standard /api?api=KEY&url=LINK format
 async function shortenUrl(env, longUrl) {
   const domain = await getSetting(env, "shortlink_domain");
   const key = await getSetting(env, "shortlink_key");
@@ -231,17 +272,15 @@ async function shortenUrl(env, longUrl) {
   return null;
 }
 
-// Gives the user a one-time shortlink. After passing it, they come back to the bot with a token.
 async function sendVerifyLink(env, chatId, userId, row) {
   const token = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
   await env.DB.prepare("DELETE FROM tokens WHERE created < ?").bind(Date.now() - 24 * 3600 * 1000).run();
   await env.DB.prepare("INSERT INTO tokens (token, user_id, file_row_id, created) VALUES (?, ?, ?, ?)")
     .bind(token, String(userId), row.id, Date.now()).run();
 
-  const me = await tg(env, "getMe", {});
-  const short = await shortenUrl(env, `https://t.me/${me.result.username}?start=v${token}`);
+  const username = await getBotUsername(env);
+  const short = await shortenUrl(env, `https://t.me/${username}?start=v${token}`);
   if (!short) {
-    // Shortener is down or misconfigured - don't leave the user stuck, but tell the owner
     await alertOwner(env, "shortlink",
       "The shortlink service isn't responding, or the API key is wrong. Users are getting files WITHOUT verification until it's fixed. Check /status.");
     await sendFileToUser(env, chatId, row);
@@ -256,14 +295,12 @@ async function sendVerifyLink(env, chatId, userId, row) {
 }
 
 // ---------- ForceSub check ----------
-// Returns the ForceSub channels this user has NOT joined yet
 async function getMissingChannels(env, userId) {
   const channels = await getChannels(env, "forcesub");
   const checks = await Promise.all(channels.map(async (c) => {
     const r = await tg(env, "getChatMember", { chat_id: c.chat_id, user_id: userId });
     if (!r.ok) {
-      if (/user not found|PARTICIPANT_ID_INVALID/i.test(r.description || "")) return c; // not joined
-      // I can't check this channel (maybe I lost admin). Don't lock users out, but warn the owner.
+      if (/user not found|PARTICIPANT_ID_INVALID/i.test(r.description || "")) return c;
       await alertOwner(env, `fs${c.chat_id}`,
         `ForceSub can't check "${c.title}": ${r.description}. Make sure I'm still an admin there. Until then users are NOT being checked for that channel.`);
       return null;
@@ -276,7 +313,6 @@ async function getMissingChannels(env, userId) {
   return checks.filter(Boolean);
 }
 
-// Makes sure a ForceSub channel has a join link (older channels may not have one saved)
 async function ensureLink(env, c) {
   if (c.link) return c.link;
   const chat = await tg(env, "getChat", { chat_id: c.chat_id });
@@ -293,7 +329,6 @@ async function ensureLink(env, c) {
   return link;
 }
 
-// Sends the file, or asks the user to join the channels first
 async function deliverFile(env, chatId, userId, row, verified) {
   const missing = await getMissingChannels(env, userId);
   if (!missing.length) {
@@ -323,10 +358,10 @@ const MAIN_MENU = {
   text: "⚙️ <b>Settings</b>\n\nSelect what you want to configure:",
   buttons: [
     [{ text: "📥 Source Channels", callback_data: "role:source" }],
-    [{ text: "🎓 Lectures Channel", callback_data: "role:lectures" }],
+    [{ text: "🎬 Movies / Videos Channel", callback_data: "role:lectures" }],
     [{ text: "📄 PDFs Channel", callback_data: "role:pdfs" }],
     [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
-    [{ text: "🎬 IMDb, TMDb & MediaInfo", callback_data: "meta:menu" }],
+    [{ text: "🎬 IMDb, TMDb, Grouping & Shield", callback_data: "meta:menu" }],
     [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "del:menu" }],
     [{ text: "🖼️ Cover Images", callback_data: "cov:menu" }],
@@ -335,10 +370,7 @@ const MAIN_MENU = {
   ],
 };
 
-// Placeholders for settings we build in later steps
-const SUB_MENUS = {
-};
-
+const SUB_MENUS = {};
 const BACK_BUTTON = [[{ text: "⬅️ Back", callback_data: "back" }]];
 
 async function buildRoleMenu(env, role) {
@@ -386,17 +418,17 @@ async function buildCoverMenu(env, note) {
   const pdf = await getSetting(env, "cover_pdf");
   const lec = await getSetting(env, "cover_lecture");
   let text = "🖼️ <b>Cover Images</b>\n\n" +
-    "A cover is the picture shown on each channel post. If none is set, I use the movie poster (if IMDb/TMDb is ON) or the file's own thumbnail.\n\n" +
+    "A cover is the picture shown on each channel post. If none is set, I automatically use the official TMDb/IMDb poster or the file's thumbnail.\n\n" +
     `📄 PDF cover: ${pdf ? "✅ Set" : "❌ Not set"}\n` +
-    `🎓 Lecture cover: ${lec ? "✅ Set" : "❌ Not set"}`;
+    `🎬 Video/Movie fallback cover: ${lec ? "✅ Set" : "❌ Not set (uses TMDb/IMDb poster)"}`;
   if (note) text += `\n\n${note}`;
 
   const buttons = [
     [{ text: pdf ? "📄 Change PDF Cover" : "📄 Set PDF Cover", callback_data: "cov:set:pdf" }],
-    [{ text: lec ? "🎓 Change Lecture Cover" : "🎓 Set Lecture Cover", callback_data: "cov:set:lecture" }],
+    [{ text: lec ? "🎬 Change Video Cover" : "🎬 Set Video Cover", callback_data: "cov:set:lecture" }],
   ];
   if (pdf) buttons.push([{ text: "🗑 Remove PDF Cover", callback_data: "cov:rm:pdf" }]);
-  if (lec) buttons.push([{ text: "🗑 Remove Lecture Cover", callback_data: "cov:rm:lecture" }]);
+  if (lec) buttons.push([{ text: "🗑 Remove Video Cover", callback_data: "cov:rm:lecture" }]);
   buttons.push(...BACK_BUTTON);
   return { text, buttons };
 }
@@ -423,10 +455,11 @@ function formatDelay(mins) {
 }
 
 async function buildDeleteMenu(env, note) {
-  const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
-  let text = "🗑️ <b>File Delete Settings</b>\n\n" +
-    "Files sent by the bot are deleted from the user's chat after the time you choose. " +
-    "Telegram allows up to 47 hours.\n\n" +
+  const rawMins = await getSetting(env, "delete_minutes");
+  const mins = rawMins === null ? 10 : parseInt(rawMins, 10);
+  let text = "🗑️ <b>File Delete Settings (Anti-Copyright)</b>\n\n" +
+    "Files sent by the bot are automatically deleted from the user's private chat after the time you choose. " +
+    "Keeping this around 5–15 minutes strongly protects your bot from copyright strikes.\n\n" +
     `Current: <b>${formatDelay(mins)}</b>`;
   if (note) text += `\n\n${note}`;
 
@@ -454,26 +487,42 @@ async function showDeleteMenu(env, chatId, messageId, note) {
   });
 }
 
-// ---------- IMDb, TMDb & MediaInfo settings menu ----------
+// ---------- IMDb, TMDb, Multi-Quality & Anti-Copyright Menu ----------
 async function buildMetaMenu(env, note) {
   const metaOn = (await getSetting(env, "meta_enabled")) === "1";
   const miOn = (await getSetting(env, "mediainfo_enabled")) !== "0"; // ON by default
+  const groupOn = (await getSetting(env, "group_qualities")) !== "0"; // ON by default
+  const shieldOn = (await getSetting(env, "shield_redirect")) !== "0"; // ON by default
+  const protectOn = (await getSetting(env, "protect_files")) === "1"; // OFF by default
   const tmdbKey = await getSetting(env, "tmdb_key");
   const omdbKey = await getSetting(env, "omdb_key");
 
-  let text = "🎬 <b>IMDb, TMDb & MediaInfo</b>\n\n" +
-    "Automatically enriches video posts with IMDb/TMDb ratings, posters, genres, plot, and technical MediaInfo (resolution, codecs, audio, bitrate, duration).\n\n" +
-    `IMDb/TMDb Auto-Fetch: ${metaOn ? "✅ ON" : "❌ OFF"}\n` +
-    `MediaInfo Display: ${miOn ? "✅ ON" : "❌ OFF"}\n` +
-    `TMDb API Key: ${tmdbKey ? "<code>" + esc(tmdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n` +
+  let text = "🎬 <b>IMDb, TMDb, Multi-Quality & Copyright Shield</b>\n\n" +
+    "• <b>Combine Qualities:</b> Merges 480p, 720p, 1080p, 4K uploads of the same movie into ONE post with multiple buttons.\n" +
+    "• <b>MediaInfo:</b> Extracts audio languages, subtitles, codecs, resolution & bitrate.\n" +
+    "• <b>Redirect Shield:</b> Uses your Worker link on channel buttons instead of a direct bot link—protects the channel & lets you swap bots if banned.\n" +
+    "• <b>Forward Lock:</b> Blocks users from forwarding files out of the bot.\n\n" +
+    `🎬 IMDb/TMDb Info: ${metaOn ? "✅ ON" : "❌ OFF"}\n` +
+    `🗂 Combine Qualities (1 Post): ${groupOn ? "✅ ON" : "❌ OFF"}\n` +
+    `📊 Deep MediaInfo (Audio/Subs): ${miOn ? "✅ ON" : "❌ OFF"}\n` +
+    `🛡️ Worker Redirect Shield: ${shieldOn ? "✅ ON" : "❌ OFF"}\n` +
+    `🔒 Lock File Forwarding: ${protectOn ? "✅ ON" : "❌ OFF"}\n\n` +
+    `TMDb Key: ${tmdbKey ? "<code>" + esc(tmdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n` +
     `OMDb (IMDb) Key: ${omdbKey ? "<code>" + esc(omdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}`;
   if (note) text += `\n\n${note}`;
 
   const buttons = [
-    [{ text: metaOn ? "🔴 Turn OFF IMDb/TMDb" : "🟢 Turn ON IMDb/TMDb", callback_data: "meta:toggle" }],
-    [{ text: miOn ? "📊 Turn OFF MediaInfo" : "📊 Turn ON MediaInfo", callback_data: "meta:mitoggle" }],
-    [{ text: "🔑 Set TMDb API Key", callback_data: "meta:tmdb" }],
-    [{ text: "🔑 Set OMDb (IMDb) Key", callback_data: "meta:omdb" }],
+    [{ text: metaOn ? "🎬 IMDb/TMDb: ON" : "🎬 IMDb/TMDb: OFF (Tap to ON)", callback_data: "meta:toggle" }],
+    [{ text: groupOn ? "🗂 Combine Qualities: ON" : "🗂 Combine Qualities: OFF", callback_data: "meta:grouptoggle" }],
+    [{ text: miOn ? "📊 MediaInfo (Audio/Subs): ON" : "📊 MediaInfo: OFF", callback_data: "meta:mitoggle" }],
+    [
+      { text: shieldOn ? "🛡️ Link Shield: ON" : "🛡️ Link Shield: OFF", callback_data: "meta:shieldtoggle" },
+      { text: protectOn ? "🔒 Forward Lock: ON" : "🔓 Forward Lock: OFF", callback_data: "meta:prottoggle" },
+    ],
+    [
+      { text: "🔑 Set TMDb Key", callback_data: "meta:tmdb" },
+      { text: "🔑 Set OMDb Key", callback_data: "meta:omdb" },
+    ],
     ...BACK_BUTTON,
   ];
   return { text, buttons };
@@ -611,8 +660,9 @@ async function handleSettingInput(env, msg, field) {
   if (field === "tmdb_key" || field === "omdb_key") {
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
     await setSetting(env, field, value);
+    await setSetting(env, "meta_enabled", "1"); // Auto-enable once key is added
     await clearState(env, userId);
-    const mmenu = await buildMetaMenu(env, "✅ API key saved.");
+    const mmenu = await buildMetaMenu(env, "✅ API key saved & IMDb/TMDb enabled!");
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: mmenu.text,
@@ -625,7 +675,6 @@ async function handleSettingInput(env, msg, field) {
     value = value.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
   }
   if (field === "shortlink_key") {
-    // Remove the owner's message so the key doesn't stay in the chat
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
   }
   await setSetting(env, field, value);
@@ -648,7 +697,6 @@ async function handleSettingInput(env, msg, field) {
 }
 
 // ---------- Checking a channel ----------
-// Works out which channel the owner meant (forwarded message, ID, or @username)
 function extractChannelRef(msg) {
   const fo = msg.forward_origin;
   if (fo && fo.type === "channel") return fo.chat.id;
@@ -660,7 +708,6 @@ function extractChannelRef(msg) {
   return null;
 }
 
-// Makes sure the channel exists and that I'm an admin there
 async function checkChannel(env, ref, role) {
   const chat = await tg(env, "getChat", { chat_id: ref });
   if (!chat.ok) return { error: "I can't find that channel. Check the ID and make sure I'm added as an admin." };
@@ -677,7 +724,6 @@ async function checkChannel(env, ref, role) {
   if ((role === "lectures" || role === "pdfs") && member.result.can_post_messages === false) {
     return { error: "I'm an admin there, but I need the <b>Post Messages</b> permission. Turn it on and send again." };
   }
-  // ForceSub channels need a join link for the buttons
   if (role === "forcesub") {
     let link = chat.result.username ? `https://t.me/${chat.result.username}` : null;
     if (!link) {
@@ -693,13 +739,8 @@ async function checkChannel(env, ref, role) {
 }
 
 // ---------- Users, stats, post and broadcast ----------
-// Days (for stats) follow this time zone. 330 = India (IST). Change if you like.
 const TZ_OFFSET_MIN = 330;
-
-// Coming back from the shortlink faster than this = they skipped it
 const MIN_VERIFY_SECONDS = 8;
-
-// Rate limit: at most RATE_MAX actions per RATE_WINDOW_MS for each user
 const RATE_MAX = 8;
 const RATE_WINDOW_MS = 10000;
 
@@ -708,7 +749,6 @@ function dayString(daysAgo) {
   return new Date(t).toISOString().slice(0, 10);
 }
 
-// Saves the user and returns true if they are banned
 async function recordUser(env, from) {
   const r = await env.DB.prepare(
     "INSERT INTO users (user_id, first_name, joined_day, last_seen, active) VALUES (?, ?, ?, ?, 1) " +
@@ -718,7 +758,6 @@ async function recordUser(env, from) {
   return !!(r && r.banned);
 }
 
-// Every channel I know, so /post can let you choose (max 30)
 async function getPostTargets(env) {
   const r = await env.DB.prepare(
     "SELECT chat_id, title, GROUP_CONCAT(role) AS roles FROM channels GROUP BY chat_id ORDER BY title, chat_id"
@@ -732,7 +771,6 @@ async function countBroadcastUsers(env) {
 }
 
 // ---------- Alerts to the owner ----------
-// Tells the owner about a problem, at most once per 30 minutes for each kind of problem
 async function alertOwner(env, key, text) {
   try {
     const last = parseInt((await getSetting(env, `alert_${key}`)) || "0", 10);
@@ -745,7 +783,6 @@ async function alertOwner(env, key, text) {
 }
 
 // ---------- Rate limit ----------
-// Returns true if this user is sending too fast and should be ignored
 async function isRateLimited(env, userId, chatId) {
   const now = Date.now();
   const r = await env.DB.prepare("SELECT window_start, count FROM rate WHERE user_id = ?").bind(String(userId)).first();
@@ -763,16 +800,14 @@ async function isRateLimited(env, userId, chatId) {
   return count > RATE_MAX;
 }
 
-// In a Source group, only admins (or you) may add files; otherwise anyone could post through me
 async function isTrustedSender(env, post) {
-  if (post.sender_chat && post.sender_chat.id === post.chat.id) return true; // admin posting anonymously
+  if (post.sender_chat && post.sender_chat.id === post.chat.id) return true;
   if (!post.from) return false;
   if (String(post.from.id) === String(env.OWNER_ID)) return true;
   const r = await tg(env, "getChatMember", { chat_id: post.chat.id, user_id: post.from.id });
   return r.ok && (r.result.status === "creator" || r.result.status === "administrator");
 }
 
-// The /post channel picker
 function renderPicker(targets, mask, note) {
   let text = "📣 <b>Choose where to post</b>\n\nTap a channel to switch it on or off, then tap Send.";
   if (note) text += `\n\n${note}`;
@@ -787,7 +822,6 @@ function renderPicker(targets, mask, note) {
   return { text, buttons };
 }
 
-// After the owner sends the message for /post or /broadcast
 async function askConfirm(env, msg, kind) {
   const userId = String(msg.from.id);
   await clearState(env, userId);
@@ -801,7 +835,6 @@ async function askConfirm(env, msg, kind) {
       });
       return;
     }
-    // Everything is switched on except channels that are only Source channels
     let mask = 0;
     targets.forEach((c, i) => { if (c.roles !== "source") mask |= 1 << i; });
     await setState(env, userId, `pick:${msg.message_id}:${mask}`);
@@ -830,12 +863,10 @@ async function askConfirm(env, msg, kind) {
   });
 }
 
-// Sends the broadcast to the next batch of users. Called right away and then every minute by the cron.
 async function processBroadcast(env, limit) {
   const job = await env.DB.prepare("SELECT * FROM broadcasts WHERE status = 'running' ORDER BY id LIMIT 1").first();
   if (!job) return;
 
-  // Short lock so two runs can never send to the same users at once
   const now = Date.now();
   const lock = await env.DB.prepare(
     "UPDATE broadcasts SET locked_until = ? WHERE id = ? AND locked_until < ? AND status = 'running'"
@@ -852,7 +883,7 @@ async function processBroadcast(env, limit) {
     const r = await tg(env, "copyMessage", {
       chat_id: u.user_id, from_chat_id: job.from_chat, message_id: job.message_id,
     });
-    if (!r.ok && r.error_code === 429) { // Telegram says slow down: pause and continue later
+    if (!r.ok && r.error_code === 429) {
       backoff = ((r.parameters && r.parameters.retry_after) || 5) * 1000;
       break;
     }
@@ -860,7 +891,7 @@ async function processBroadcast(env, limit) {
       sent++;
     } else {
       failed++;
-      if (r.error_code === 403) { // blocked the bot: skip them in future broadcasts
+      if (r.error_code === 403) {
         await env.DB.prepare("UPDATE users SET active = 0 WHERE user_id = ?").bind(u.user_id).run();
       }
     }
@@ -884,7 +915,6 @@ async function processBroadcast(env, limit) {
   }
 }
 
-// Runs every minute. Deletions and broadcasts share Cloudflare's free request limit per run.
 async function runCron(env) {
   try {
     await setSetting(env, "last_cron", String(Date.now()));
@@ -928,18 +958,16 @@ async function sendStats(env, chatId) {
     `🆕 Joined today: <b>${joined.n}</b>\n` +
     `✅ Verifications today: <b>${ver.n}</b> (${ver.u} people)\n` +
     `📥 Files delivered today: <b>${dl.n}</b> (${dl.u} people)\n` +
-    `📁 Files posted: <b>${files.n}</b>\n` +
+    `📁 Total files indexed: <b>${files.n}</b>\n` +
     `⭐ Active subscribers: <b>${subs.n}</b>\n\n` +
     "📅 <b>Last 7 days</b>\n" + lines.join("\n") +
     "\n\n<i>Days follow India time (IST).</i>";
   await tg(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
 }
 
-// /status: is everything healthy?
 async function sendStatus(env, chatId) {
   const lines = [];
 
-  // Telegram connection
   const hook = await tg(env, "getWebhookInfo", {});
   if (hook.ok) {
     const h = hook.result;
@@ -955,20 +983,17 @@ async function sendStatus(env, chatId) {
     lines.push(`⚠️ Can't reach Telegram: ${esc(hook.description || "unknown error")}`);
   }
 
-  // Scheduled job
   const lc = parseInt((await getSetting(env, "last_cron")) || "0", 10);
   const age = lc ? Math.round((Date.now() - lc) / 60000) : null;
   lines.push(age === null ? "⚠️ Cleanup job: hasn't run yet"
     : age <= 3 ? `✅ Cleanup job: ran ${age} min ago`
     : `⚠️ Cleanup job: last ran ${age} min ago (check the cron trigger)`);
 
-  // Queues
   const q = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(delete_at <= ?) AS due FROM deletions").bind(Date.now()).first();
   lines.push(`🗑 Deletions waiting: ${q.n} (${q.due || 0} due now)`);
   const job = await env.DB.prepare("SELECT * FROM broadcasts WHERE status = 'running' LIMIT 1").first();
   if (job) lines.push(`📢 Broadcast running: ${job.sent + job.failed} of ${job.total} done`);
 
-  // Shortlink
   if ((await getSetting(env, "shortlink_enabled")) === "1") {
     const test = await shortenUrl(env, "https://t.me/telegram");
     lines.push(test ? "✅ Shortlink: working" : "⚠️ Shortlink: NOT working (users skip verification)");
@@ -977,14 +1002,17 @@ async function sendStatus(env, chatId) {
   }
   const metaOn = (await getSetting(env, "meta_enabled")) === "1";
   lines.push(metaOn ? "✅ IMDb/TMDb: on" : "➖ IMDb/TMDb: off");
-  const mins = parseInt((await getSetting(env, "delete_minutes")) || "0", 10);
-  lines.push(`➖ Auto-delete: ${formatDelay(mins)}`);
+  const groupOn = (await getSetting(env, "group_qualities")) !== "0";
+  lines.push(groupOn ? "✅ Multi-Quality Grouping: on" : "➖ Multi-Quality Grouping: off");
+  const rawMins = await getSetting(env, "delete_minutes");
+  const mins = rawMins === null ? 10 : parseInt(rawMins, 10);
+  lines.push(`🛡️ Auto-delete: ${formatDelay(mins)}`);
+
   const upiId = await getSetting(env, "upi_id");
   const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM payments WHERE status = 'submitted'").first();
   lines.push(upiId ? `✅ Payments: UPI set, ${waiting.n} waiting for your approval` : "➖ Payments: UPI ID not set");
   lines.push((await starsEnabled(env)) ? "✅ Payments: Stars on" : "➖ Payments: Stars off");
 
-  // Channels: am I still an admin?
   const me = await tg(env, "getMe", {});
   const chans = await env.DB.prepare(
     "SELECT chat_id, title, GROUP_CONCAT(role) AS roles FROM channels GROUP BY chat_id ORDER BY title LIMIT 10"
@@ -1028,13 +1056,12 @@ async function starsEnabled(env) {
   return (await getSetting(env, "stars_off")) !== "1";
 }
 
-let APP_ORIGIN = null; // this Worker's web address, learned from incoming requests
+let APP_ORIGIN = null;
 
 function fmtDate(ms) {
   return new Date(ms + TZ_OFFSET_MIN * 60000).toISOString().slice(0, 10);
 }
 
-// Returns the expiry time if the user has an active plan, otherwise 0. Checked at every delivery.
 async function getSubExpiry(env, userId) {
   const r = await env.DB.prepare("SELECT expires_at FROM subscriptions WHERE user_id = ?").bind(String(userId)).first();
   return r && r.expires_at > Date.now() ? r.expires_at : 0;
@@ -1044,7 +1071,6 @@ async function hasActiveSub(env, userId) {
   return (await getSubExpiry(env, userId)) > 0;
 }
 
-// Adds the plan's days on top of whatever time the user still has left
 async function activateSubscription(env, userId, planKey) {
   const cur = await env.DB.prepare("SELECT expires_at FROM subscriptions WHERE user_id = ?").bind(String(userId)).first();
   const start = Math.max(Date.now(), cur ? cur.expires_at : 0);
@@ -1054,7 +1080,7 @@ async function activateSubscription(env, userId, planKey) {
   return expires;
 }
 
-// ---------- Mini App security: proves the request really comes from this Telegram user ----------
+// ---------- Mini App security ----------
 async function hmacSha256(key, data) {
   const k = await crypto.subtle.importKey(
     "raw", typeof key === "string" ? new TextEncoder().encode(key) : key,
@@ -1063,7 +1089,6 @@ async function hmacSha256(key, data) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(data)));
 }
 
-// Returns the Telegram user if the Mini App data is genuine and fresh (under 24 hours), otherwise null
 async function verifyInitData(env, initData) {
   if (!initData || initData.length > 4096) return null;
   const params = new URLSearchParams(initData);
@@ -1523,7 +1548,7 @@ async function handleMessage(msg, env) {
       if (!t || String(t.user_id) !== userId || !fresh) {
         await tg(env, "sendMessage", {
           chat_id: chatId,
-          text: "⚠️ This verification link is invalid or has expired. Please tap <b>Get File</b> on the channel post again.",
+          text: "⚠️ This verification link is invalid or has expired. Please tap the quality button on the channel post again.",
           parse_mode: "HTML",
         });
         return;
@@ -1560,7 +1585,7 @@ async function handleMessage(msg, env) {
     }
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "👋 Hi! I'm your Autoposter bot.\nOwner can use /settings to configure me.",
+      text: "👋 Hi! Select any quality button on our channel posts to get your file instantly.\n\nOwner can use /settings to configure me.",
     });
     return;
   }
@@ -1632,7 +1657,7 @@ async function handleMessage(msg, env) {
     await setState(env, userId, "post");
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "📣 Send the message you want to post (text, photo, video, file, anything). I'll ask you to confirm before it goes out.\n\nIt will be posted as it is to your Lectures, PDFs, and ForceSub channels.\n\n/cancel to stop.",
+      text: "📣 Send the message you want to post (text, photo, video, file, anything). I'll ask you to confirm before it goes out.\n\n/cancel to stop.",
     });
     return;
   }
@@ -1875,7 +1900,7 @@ async function handleButton(query, env) {
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: messageId,
-        text: `🖼️ Send the photo to use as the <b>${kind === "pdf" ? "PDF" : "Lecture"} cover</b>. It will be shown on every new post.`,
+        text: `🖼️ Send the photo to use as the <b>${kind === "pdf" ? "PDF" : "Video"} cover</b>.`,
         parse_mode: "HTML",
         reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "cov:menu" }]] },
       });
@@ -1896,7 +1921,7 @@ async function handleButton(query, env) {
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: messageId,
-        text: "✏️ Send the number of minutes (1 to 2820). For example, <code>90</code> means 1.5 hours.",
+        text: "✏️ Send the number of minutes (1 to 2820). For example, <code>10</code> means 10 minutes.",
         parse_mode: "HTML",
         reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "del:menu" }]] },
       });
@@ -1933,7 +1958,7 @@ async function handleButton(query, env) {
         message_id: messageId,
         text: sub === "upi"
           ? "💳 Send your UPI ID, like <code>name@bank</code>. Customers will pay to this ID."
-          : "💳 Send the name to show on payments, like <code>My Classes</code>.",
+          : "💳 Send the name to show on payments, like <code>My Channel</code>.",
         parse_mode: "HTML",
         reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "pay:menu" }]] },
       });
@@ -1968,7 +1993,7 @@ async function handleButton(query, env) {
     return;
   }
 
-  // IMDb, TMDb & MediaInfo settings: meta:menu, meta:toggle, meta:mitoggle, meta:tmdb, meta:omdb
+  // IMDb, TMDb, Multi-Quality & Shield settings
   if (action === "meta") {
     const sub = parts[1];
     if (sub === "tmdb" || sub === "omdb") {
@@ -2000,6 +2025,18 @@ async function handleButton(query, env) {
       const miOn = (await getSetting(env, "mediainfo_enabled")) !== "0";
       await setSetting(env, "mediainfo_enabled", miOn ? "0" : "1");
     }
+    if (sub === "grouptoggle") {
+      const gOn = (await getSetting(env, "group_qualities")) !== "0";
+      await setSetting(env, "group_qualities", gOn ? "0" : "1");
+    }
+    if (sub === "shieldtoggle") {
+      const sOn = (await getSetting(env, "shield_redirect")) !== "0";
+      await setSetting(env, "shield_redirect", sOn ? "0" : "1");
+    }
+    if (sub === "prottoggle") {
+      const pOn = (await getSetting(env, "protect_files")) === "1";
+      await setSetting(env, "protect_files", pOn ? "0" : "1");
+    }
     await clearState(env, userId);
     const mmenu = await buildMetaMenu(env, note);
     await tg(env, "editMessageText", {
@@ -2012,7 +2049,7 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Shortlink settings: sl:menu, sl:toggle, sl:domain, sl:key
+  // Shortlink settings
   if (action === "sl") {
     const sub = parts[1];
     if (sub === "domain" || sub === "key") {
@@ -2056,15 +2093,22 @@ async function handleButton(query, env) {
   }
 }
 
-// ---------- IMDb, TMDb & MediaInfo Helpers ----------
+// ---------- IMDb, TMDb & Deep MediaInfo (Audio, Subtitles, Quality) ----------
+
 function parseMediaTitle(raw) {
   const firstLine = (raw || "").split("\n")[0].trim();
-  const base = firstLine.replace(/\.[a-zA-Z0-9]{2,4}$/, "").replace(/[._]+/g, " ");
+  // Remove leading @channel tags or [brackets] at start
+  const withoutPrefix = firstLine
+    .replace(/^(@\w+\s*[-–|:]?\s*)+/i, "")
+    .replace(/^(\[[^\]]+\]\s*)+/, "")
+    .replace(/\.[a-zA-Z0-9]{2,4}$/, "")
+    .replace(/[._]+/g, " ")
+    .trim();
 
-  // Detect TV Show pattern (e.g., S01E02 or S01)
-  const tvMatch = base.match(/^(.*?)\bS(\d{1,2})(?:E(\d{1,2}))?\b/i);
+  // 1. Detect TV Show pattern (e.g., S01E02 or S01)
+  const tvMatch = withoutPrefix.match(/^(.*?)\bS(\d{1,2})[\s._-]*E?(\d{1,3})?\b/i);
   if (tvMatch && tvMatch[1].trim().length > 1) {
-    const cleanTv = tvMatch[1].replace(/\b(19\d{2}|20\d{2})\b.*/, "").replace(/[\(\[\-\–]+$/, "").trim();
+    const cleanTv = tvMatch[1].replace(/\b(19\d{2}|20\d{2})\b.*/, "").replace(/[\(\[\-\–:]+$/, "").trim();
     const yearMatch = tvMatch[1].match(/\b(19\d{2}|20\d{2})\b/);
     return {
       query: cleanTv,
@@ -2075,85 +2119,205 @@ function parseMediaTitle(raw) {
     };
   }
 
-  // Detect Movie pattern with Year (e.g., "Oppenheimer 2023 1080p...")
-  const yearMatch = base.match(/^(.*?)\b(19\d{2}|20\d{2})\b/);
-  if (yearMatch && yearMatch[1].trim().length > 1) {
+  // 2. Strip quality/codec/language tags before looking for Movie Year (so "2024" beats "2160p")
+  const tagRegex = /\b(2160p|1440p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|camrip|hdcam|predvd|web-?dl|webrip|bluray|brrip|bdrip|hdrip|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|avc|10bit|hdr10?\+?|dv|dolby|aac|ac3|eac3|ddp?5?\.?1|atmos|truehd|dts|dual\s*audio|multi\s*audio|hindi|english|tamil|telugu|malayalam|kannada|esubs?|msubs?)\b.*/i;
+  const beforeTags = withoutPrefix.replace(tagRegex, "").trim();
+
+  const yearMatch = beforeTags.match(/^(.*?)\b(19\d{2}|20[0-3]\d)\b/);
+  if (yearMatch && yearMatch[1].replace(/[\(\[\-\–:]+$/, "").trim().length > 1) {
     return {
-      query: yearMatch[1].replace(/[\(\[\-\–]+$/, "").trim(),
+      query: yearMatch[1].replace(/[\(\[\-\–:]+$/, "").trim(),
       year: yearMatch[2],
       isTv: false,
+      season: null,
+      episode: null,
     };
   }
 
-  // Fallback: strip common quality/codec tags
-  const stripped = base
-    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|web-?dl|webrip|hdrip|dvdrip|x264|x265|hevc|avc|10bit|hdr|aac|ddp?5\.?1|atmos|dual audio|hindi|english|esub)\b.*/i, "")
-    .replace(/[\(\[\-\–]+$/, "")
-    .trim();
-
-  return { query: stripped || base.slice(0, 60), year: null, isTv: false };
+  const cleanFallback = beforeTags.replace(/[\(\[\-\–:]+$/, "").trim();
+  return {
+    query: cleanFallback || withoutPrefix.slice(0, 60),
+    year: null,
+    isTv: false,
+    season: null,
+    episode: null,
+  };
 }
 
-function extractMediaInfo(info, rawCaption) {
-  const f = info.file;
-  const sourceStr = `${info.name || ""} ${rawCaption || ""}`;
+// Language dictionary for both filename tags & binary MKV/MP4 track codes
+const LANG_PATTERNS = [
+  { name: "Hindi", re: /\b(hindi|hin)\b/i },
+  { name: "English", re: /\b(english|eng)\b/i },
+  { name: "Tamil", re: /\b(tamil|tam)\b/i },
+  { name: "Telugu", re: /\b(telugu|tel)\b/i },
+  { name: "Malayalam", re: /\b(malayalam|mal)\b/i },
+  { name: "Kannada", re: /\b(kannada|kan)\b/i },
+  { name: "Bengali", re: /\b(bengali|ben)\b/i },
+  { name: "Marathi", re: /\b(marathi|mar)\b/i },
+  { name: "Punjabi", re: /\b(punjabi|pan)\b/i },
+  { name: "Gujarati", re: /\b(gujarati|guj)\b/i },
+  { name: "Japanese", re: /\b(japanese|jpn|jap)\b/i },
+  { name: "Korean", re: /\b(korean|kor)\b/i },
+  { name: "Chinese", re: /\b(chinese|chi|zho)\b/i },
+  { name: "Spanish", re: /\b(spanish|spa)\b/i },
+  { name: "French", re: /\b(french|fre|fra)\b/i },
+  { name: "German", re: /\b(german|ger|deu)\b/i },
+  { name: "Russian", re: /\b(russian|rus)\b/i },
+  { name: "Arabic", re: /\b(arabic|ara)\b/i },
+  { name: "Indonesian", re: /\b(indonesian|ind)\b/i },
+];
 
-  // Resolution
-  let res = null;
+// Deep binary inspection for files <= 20MB (Telegram getFile limit)
+async function inspectBinaryHeader(env, fileId, fileSize) {
+  if (!fileSize || fileSize > 20 * 1024 * 1024) return null;
+  try {
+    const gf = await tg(env, "getFile", { file_id: fileId });
+    if (!gf.ok || !gf.result || !gf.result.file_path) return null;
+    const url = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${gf.result.file_path}`;
+    const res = await fetch(url, { headers: { Range: "bytes=0-131071" } });
+    if (!res.ok) return null;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const text = new TextDecoder("latin1").decode(buf);
+    const langs = [];
+    for (const lp of LANG_PATTERNS) {
+      if (lp.re.test(text) && !langs.includes(lp.name)) langs.push(lp.name);
+    }
+    const hasSub = /S_TEXT\/UTF8|S_TEXT\/ASS|wvtt|tx3g|stpp/i.test(text);
+    return { langs, hasSub };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function extractMediaInfo(env, info, rawCaption) {
+  const f = info.file;
+  const sourceStr = `${info.name || ""}\n${rawCaption || ""}`;
+
+  // 1. Quality / Resolution Label + Sort Order (480p -> 720p -> 1080p -> 2160p)
+  let quality = "HD";
+  let qOrder = 5;
+  let exactRes = null;
+
+  const qMatch = sourceStr.match(/\b(2160p|4K|UHD|1440p|2K|1080p|FHD|720p|540p|480p|360p|240p|CAMRip|HDCAM|PreDVD|HQ\s*S-?Print)\b/i);
   if (f.width && f.height) {
-    const h = Math.min(f.width, f.height);
-    const label = h >= 2160 ? "4K" : h >= 1080 ? "1080p" : h >= 720 ? "720p" : h >= 480 ? "480p" : `${h}p`;
-    res = `${f.width}×${f.height} (${label})`;
-  } else {
-    const m = sourceStr.match(/\b(2160p|1080p|720p|480p|360p|4K)\b/i);
-    if (m) res = m[1].toUpperCase();
+    exactRes = `${f.width}×${f.height}`;
+    const shortSide = Math.min(f.width, f.height);
+    const longSide = Math.max(f.width, f.height);
+    if (longSide >= 3800 || shortSide >= 2100) { quality = "2160p 4K"; qOrder = 4; }
+    else if (longSide >= 2500 || shortSide >= 1400) { quality = "1440p 2K"; qOrder = 3.5; }
+    else if (longSide >= 1900 || shortSide >= 1000) { quality = "1080p"; qOrder = 3; }
+    else if (longSide >= 1200 || shortSide >= 700) { quality = "720p"; qOrder = 2; }
+    else if (longSide >= 800 || shortSide >= 460) { quality = "480p"; qOrder = 1; }
+    else { quality = "360p"; qOrder = 0.5; }
+  }
+  if (qMatch) {
+    const rawQ = qMatch[1].toUpperCase();
+    if (/2160P|4K|UHD/.test(rawQ)) { quality = "2160p 4K"; qOrder = 4; }
+    else if (/1440P|2K/.test(rawQ)) { quality = "1440p 2K"; qOrder = 3.5; }
+    else if (/1080P|FHD/.test(rawQ)) { quality = "1080p"; qOrder = 3; }
+    else if (/720P/.test(rawQ)) { quality = "720p"; qOrder = 2; }
+    else if (/540P/.test(rawQ)) { quality = "540p"; qOrder = 1.5; }
+    else if (/480P/.test(rawQ)) { quality = "480p"; qOrder = 1; }
+    else if (/360P/.test(rawQ)) { quality = "360p"; qOrder = 0.5; }
+    else { quality = rawQ; qOrder = 0.2; }
   }
 
-  // Duration
+  // 2. Source & Video Codec
+  const ripMatch = sourceStr.match(/\b(BluRay|BRRip|BDRip|REMUX|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAMRip|HDCAM)\b/i);
+  const vCodecMatch = sourceStr.match(/\b(x264|x265|H\.?264|H\.?265|HEVC|AVC|AV1|VP9|10-?bit)\b/i);
+  const hdrMatch = sourceStr.match(/\b(HDR10\+?|Dolby\s*Vision|DV|HDR)\b/i);
+
+  const vParts = [];
+  if (ripMatch) vParts.push(ripMatch[1]);
+  if (vCodecMatch) vParts.push(vCodecMatch[1].toUpperCase());
+  if (hdrMatch) vParts.push(hdrMatch[1].toUpperCase());
+  const videoTag = vParts.join(" · ") || null;
+
+  // 3. Audio Languages & Audio Codec
+  const detectedLangs = [];
+  for (const lp of LANG_PATTERNS) {
+    if (lp.re.test(sourceStr)) detectedLangs.push(lp.name);
+  }
+
+  // Optional binary header check if file <= 20MB
+  const bin = await inspectBinaryHeader(env, f.file_id, f.file_size);
+  if (bin && bin.langs.length) {
+    for (const l of bin.langs) {
+      if (!detectedLangs.includes(l)) detectedLangs.push(l);
+    }
+  }
+
+  let audioLangStr = detectedLangs.join(", ");
+  if (!audioLangStr) {
+    if (/\bdual\s*audio\b/i.test(sourceStr)) audioLangStr = "Dual Audio (Hindi, English)";
+    else if (/\bmulti\s*audio\b/i.test(sourceStr)) audioLangStr = "Multi Audio";
+  } else if (/\bdual\s*audio\b/i.test(sourceStr) && detectedLangs.length === 1) {
+    audioLangStr += " + Dual Audio";
+  }
+
+  const aCodecMatch = sourceStr.match(/\b(AAC|AC3|EAC3|DDP|DD\+|DTS(?:-HD)?|TrueHD|Atmos|FLAC|MP3|Opus)\b/i);
+  const chanMatch = sourceStr.match(/\b(7\.1|5\.1|2\.0)\b/);
+  const aCodecParts = [];
+  if (aCodecMatch) aCodecParts.push(aCodecMatch[1].toUpperCase().replace("DDP", "DD+"));
+  if (chanMatch) aCodecParts.push(`${chanMatch[1]}ch`);
+  const audioCodecStr = aCodecParts.join(" ");
+
+  const fullAudio = [audioLangStr, audioCodecStr ? `(${audioCodecStr})` : ""].filter(Boolean).join(" ") || null;
+
+  // 4. Subtitles
+  let subtitles = null;
+  if (/\b(esubs?|eng\s*subs?|english\s*subs?|subtitles?|soft\s*subs?)\b/i.test(sourceStr)) {
+    subtitles = "English (ESub)";
+  } else if (/\b(msubs?|multi\s*subs?)\b/i.test(sourceStr)) {
+    subtitles = "Multi-Language (MSub)";
+  } else if (/\b(hc-?sub|hardsub|korsub)\b/i.test(sourceStr)) {
+    subtitles = "Hardcoded Subtitles";
+  } else if (bin && bin.hasSub) {
+    subtitles = "Embedded Subtitles";
+  }
+
+  // 5. Duration & Bitrate & Container
   let duration = null;
   if (f.duration) {
     const hrs = Math.floor(f.duration / 3600);
     const mins = Math.floor((f.duration % 3600) / 60);
-    const secs = f.duration % 60;
-    duration = hrs > 0 ? `${hrs}h ${mins}m ${secs}s` : `${mins}m ${secs}s`;
+    duration = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
   }
 
-  // Overall Bitrate (calculated from size & duration)
   let bitrate = null;
   if (f.file_size && f.duration && f.duration > 0) {
     const kbps = Math.round((f.file_size * 8) / f.duration / 1000);
     bitrate = kbps >= 1000 ? `${(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`;
   }
 
-  // Video Codec & Color
-  const vCodecMatch = sourceStr.match(/\b(x264|x265|H\.?264|H\.?265|HEVC|AVC|AV1|VP9)\b/i);
-  const hdrMatch = sourceStr.match(/\b(HDR10\+?|Dolby\s*Vision|DV|10-?bit)\b/i);
-  const vParts = [];
-  if (vCodecMatch) vParts.push(vCodecMatch[1].toUpperCase());
-  if (hdrMatch) vParts.push(hdrMatch[1]);
-  const videoCodec = vParts.join(" · ") || null;
-
-  // Audio Codec & Channels
-  const aCodecMatch = sourceStr.match(/\b(AAC|AC3|EAC3|DDP|DD\+|DTS(?:-HD)?|TrueHD|Atmos|FLAC|MP3|Opus)\b/i);
-  const chanMatch = sourceStr.match(/\b(7\.1|5\.1|2\.0)\b/);
-  const aParts = [];
-  if (aCodecMatch) aParts.push(aCodecMatch[1].toUpperCase());
-  if (chanMatch) aParts.push(`${chanMatch[1]}ch`);
-  const audioCodec = aParts.join(" ") || null;
-
-  // Container format
   const extMatch = (info.name || "").match(/\.([a-zA-Z0-9]{2,4})$/);
-  const container = extMatch ? extMatch[1].toUpperCase() : (f.mime_type ? f.mime_type.split("/")[1].toUpperCase() : null);
+  const container = extMatch ? extMatch[1].toUpperCase() : (f.mime_type ? f.mime_type.split("/")[1].toUpperCase() : "MKV");
 
-  return { res, duration, bitrate, videoCodec, audioCodec, container };
+  // Extra tag for button disambiguation (e.g. HEVC, 10bit)
+  let shortCodec = "";
+  if (/\b(hevc|x265|10bit)\b/i.test(sourceStr)) shortCodec = "HEVC";
+
+  return {
+    quality,
+    qOrder,
+    exactRes,
+    videoTag,
+    audioLangs: detectedLangs,
+    audioCodecStr,
+    fullAudio,
+    subtitles,
+    duration,
+    bitrate,
+    container,
+    shortCodec,
+  };
 }
 
-async function fetchMovieMeta(env, rawTitle) {
+async function fetchMovieMeta(env, rawTitle, parsed) {
   const metaOn = (await getSetting(env, "meta_enabled")) === "1";
   if (!metaOn) return null;
 
   const explicitImdb = (rawTitle || "").match(/\b(tt\d{7,9})\b/i);
-  const parsed = parseMediaTitle(rawTitle);
   if (!parsed.query && !explicitImdb) return null;
 
   const tmdbKey = await getSetting(env, "tmdb_key");
@@ -2170,6 +2334,7 @@ async function fetchMovieMeta(env, rawTitle) {
     tmdbId: null,
     mediaType: parsed.isTv ? "tv" : "movie",
     runtime: null,
+    languages: null,
   };
 
   // 1. TMDb Lookup
@@ -2187,6 +2352,12 @@ async function fetchMovieMeta(env, rawTitle) {
         const searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(parsed.query)}${yearParam}`;
         const sRes = await fetch(searchUrl).then((r) => r.json());
         item = sRes.results && sRes.results[0];
+        // Retry without year if strict year search returned nothing
+        if (!item && yearParam) {
+          const retryUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(parsed.query)}`;
+          const rRes = await fetch(retryUrl).then((r) => r.json());
+          item = rRes.results && rRes.results[0];
+        }
       }
 
       if (item) {
@@ -2204,6 +2375,9 @@ async function fetchMovieMeta(env, rawTitle) {
           result.genres = det.genres.slice(0, 3).map((g) => g.name).join(", ");
         }
         if (det.runtime) result.runtime = `${det.runtime} min`;
+        if (det.spoken_languages && det.spoken_languages.length) {
+          result.languages = det.spoken_languages.map((l) => l.english_name || l.name).filter(Boolean).join(", ");
+        }
         if (det.external_ids && det.external_ids.imdb_id) {
           result.imdbId = det.external_ids.imdb_id;
         }
@@ -2234,6 +2408,7 @@ async function fetchMovieMeta(env, rawTitle) {
         if (!result.genres && omdb.Genre && omdb.Genre !== "N/A") result.genres = omdb.Genre;
         if (!result.plot && omdb.Plot && omdb.Plot !== "N/A") result.plot = omdb.Plot;
         if (!result.runtime && omdb.Runtime && omdb.Runtime !== "N/A") result.runtime = omdb.Runtime;
+        if (!result.languages && omdb.Language && omdb.Language !== "N/A") result.languages = omdb.Language;
         if (!result.poster && omdb.Poster && omdb.Poster.startsWith("http")) result.poster = omdb.Poster;
       }
     } catch (err) {
@@ -2244,8 +2419,110 @@ async function fetchMovieMeta(env, rawTitle) {
   return result.title || result.rating || result.plot ? result : null;
 }
 
+// Builds the rich caption and sorted multi-quality buttons for a Movie / Episode post
+async function buildGroupedMediaMessage(env, meta, parsed, fallbackTitle, items) {
+  const miEnabled = (await getSetting(env, "mediainfo_enabled")) !== "0";
+
+  // Sort items from lowest quality (480p) to highest (4K), then by file size
+  items.sort((a, b) => (a.qOrder - b.qOrder) || (a.size - b.size));
+
+  let epTag = "";
+  if (parsed && parsed.isTv && parsed.season) {
+    epTag = ` — S${String(parsed.season).padStart(2, "0")}${parsed.episode ? "E" + String(parsed.episode).padStart(2, "0") : ""}`;
+  }
+
+  const displayTitle = meta && meta.title
+    ? `${meta.title}${meta.year ? ` (${meta.year})` : ""}${epTag}`
+    : `${(parsed && parsed.query) || fallbackTitle.slice(0, 200)}${parsed && parsed.year ? ` (${parsed.year})` : ""}${epTag}`;
+
+  const lines = [`🎬 <b>${esc(displayTitle)}</b>`, ""];
+
+  if (meta) {
+    if (meta.rating) lines.push(`🏆 <b>Rating:</b> ${esc(meta.rating)}`);
+    if (meta.genres) lines.push(`🎭 <b>Genre:</b> ${esc(meta.genres)}`);
+  }
+
+  // Combine Audio, Subtitles, Runtime, and Codecs across all uploaded qualities
+  if (miEnabled) {
+    const allAudioLangs = [...new Set(items.flatMap((x) => x.audioLangs || []))];
+    const allAudioCodecs = [...new Set(items.map((x) => x.audioCodecStr).filter(Boolean))];
+    let audioText = allAudioLangs.join(", ");
+    if (!audioText) {
+      const customFull = items.map((x) => x.fullAudio).find(Boolean);
+      if (customFull) audioText = customFull;
+      else if (meta && meta.languages) audioText = meta.languages;
+    } else if (allAudioCodecs.length) {
+      audioText += ` (${allAudioCodecs.join(" / ")})`;
+    }
+    if (audioText) lines.push(`🔊 <b>Audio:</b> ${esc(audioText)}`);
+
+    const allSubs = [...new Set(items.map((x) => x.subtitles).filter(Boolean))];
+    if (allSubs.length) {
+      lines.push(`💬 <b>Subtitles:</b> ${esc(allSubs.join(" / "))}`);
+    }
+
+    const runtimeStr = items.map((x) => x.duration).find(Boolean) || (meta && meta.runtime);
+    if (runtimeStr) lines.push(`⏱ <b>Runtime:</b> ${esc(runtimeStr)}`);
+
+    const quals = [...new Set(items.map((x) => x.quality))];
+    const vTags = [...new Set(items.map((x) => x.videoTag).filter(Boolean))];
+    const containers = [...new Set(items.map((x) => x.container).filter(Boolean))];
+    const techParts = [
+      quals.join(" | "),
+      vTags.join(" / "),
+      containers.join("/"),
+    ].filter(Boolean);
+    if (techParts.length) {
+      lines.push(`📊 <b>MediaInfo:</b> <code>${esc(techParts.join(" • "))}</code>`);
+    }
+  } else if (meta && meta.runtime) {
+    lines.push(`⏱ <b>Runtime:</b> ${esc(meta.runtime)}`);
+  }
+
+  if (meta && meta.plot) {
+    const shortPlot = meta.plot.length > 240 ? meta.plot.slice(0, 237) + "..." : meta.plot;
+    lines.push(`\n📝 <b>Storyline:</b> <i>${esc(shortPlot)}</i>`);
+  }
+
+  lines.push(`\n⬇️ <b>Select your preferred quality below:</b>`);
+
+  // Build quality buttons (pair 2 buttons per row when there are multiple files)
+  const qButtons = [];
+  for (const item of items) {
+    const link = await makeDeepLink(env, `f${item.rowId}`);
+    const codecBadge = item.shortCodec ? ` ${item.shortCodec}` : "";
+    const label = `📥 ${item.quality}${codecBadge} [${formatSize(item.size)}]`;
+    qButtons.push({ text: label, url: link });
+  }
+
+  const keyboard = [];
+  if (qButtons.length === 1) {
+    keyboard.push([qButtons[0]]);
+  } else {
+    for (let i = 0; i < qButtons.length; i += 2) {
+      keyboard.push(qButtons.slice(i, i + 2));
+    }
+  }
+
+  const extLinks = [];
+  if (meta && meta.imdbId) {
+    extLinks.push({ text: "⭐ IMDb", url: `https://www.imdb.com/title/${meta.imdbId}/` });
+  }
+  if (meta && meta.tmdbId) {
+    extLinks.push({ text: "🎬 TMDb", url: `https://www.themoviedb.org/${meta.mediaType}/${meta.tmdbId}` });
+  }
+  if (extLinks.length) keyboard.push(extLinks);
+
+  return {
+    postText: lines.join("\n"),
+    markup: { inline_keyboard: keyboard },
+  };
+}
+
 // ---------- Handling new posts in channels ----------
 async function handleChannelPost(post, env) {
+  await ensureExtraTables(env);
+
   const chatId = String(post.chat.id);
   const isSource = await env.DB.prepare(
     "SELECT 1 AS ok FROM channels WHERE role = 'source' AND chat_id = ?"
@@ -2272,95 +2549,152 @@ async function handleChannelPost(post, env) {
   });
   if (!rowId) return;
 
-  const me = await tg(env, "getMe", {});
-  const emoji = info.kind === "pdf" ? "📄" : "🎬";
-  const label = info.kind === "pdf" ? "PDF" : "Video / Lecture";
-
-  // 1. Fetch IMDb / TMDb metadata (only for video/lecture posts)
-  const meta = info.kind === "lecture" ? await fetchMovieMeta(env, `${post.caption || ""}\n${info.name}`) : null;
-
-  // 2. Extract MediaInfo (if enabled and video)
-  const miEnabled = (await getSetting(env, "mediainfo_enabled")) !== "0";
-  const mi = (info.kind === "lecture" && miEnabled) ? extractMediaInfo(info, post.caption) : null;
-
-  // 3. Format Caption
-  const displayTitle = meta && meta.title
-    ? `${meta.title}${meta.year ? ` (${meta.year})` : ""}`
-    : title.slice(0, 250);
-
-  const lines = [`${emoji} <b>${esc(displayTitle)}</b>`, ""];
-
-  if (meta) {
-    if (meta.rating) lines.push(`🏆 <b>Rating:</b> ${esc(meta.rating)}`);
-    if (meta.genres) lines.push(`🎭 <b>Genre:</b> ${esc(meta.genres)}`);
-    if (meta.runtime) lines.push(`⏱ <b>Runtime:</b> ${esc(meta.runtime)}`);
-  }
-
-  lines.push(`🏷 <b>Type:</b> ${label}`);
-  lines.push(`📦 <b>Size:</b> ${formatSize(info.file.file_size)}`);
-
-  if (mi) {
-    const tech = [];
-    if (mi.container) tech.push(mi.container);
-    if (mi.res) tech.push(mi.res);
-    if (mi.videoCodec) tech.push(mi.videoCodec);
-    if (mi.audioCodec) tech.push(mi.audioCodec);
-    if (mi.bitrate) tech.push(mi.bitrate);
-    if (mi.duration) tech.push(mi.duration);
-    if (tech.length) {
-      lines.push(`\n📊 <b>MediaInfo:</b>\n<code>${esc(tech.join(" | "))}</code>`);
+  // --- PDF Posting (Single Post) ---
+  if (info.kind === "pdf") {
+    const link = await makeDeepLink(env, `f${rowId}`);
+    const postText = `📄 <b>${esc(title.slice(0, 300))}</b>\n\n🏷 <b>Type:</b> PDF Document\n📦 <b>Size:</b> ${formatSize(info.file.file_size)}`;
+    const markup = { inline_keyboard: [[{ text: `📥 Get PDF [${formatSize(info.file.file_size)}]`, url: link }]] };
+    const thumb = info.file.thumbnail || info.file.thumb;
+    const cover = (await getSetting(env, "cover_pdf")) || (thumb ? thumb.file_id : null);
+    if (cover) {
+      const sent = await tg(env, "sendPhoto", { chat_id: dest[0].chat_id, photo: cover, caption: postText, parse_mode: "HTML", reply_markup: markup });
+      if (sent.ok) return;
     }
+    await tg(env, "sendMessage", { chat_id: dest[0].chat_id, text: postText, parse_mode: "HTML", reply_markup: markup });
+    return;
   }
 
-  if (meta && meta.plot) {
-    const shortPlot = meta.plot.length > 280 ? meta.plot.slice(0, 277) + "..." : meta.plot;
-    lines.push(`\n📝 <b>Plot:</b> <i>${esc(shortPlot)}</i>`);
-  }
+  // --- Video / Movie Posting (Multi-Quality Grouping + IMDb/TMDb + Deep MediaInfo) ---
+  const rawSearchText = `${post.caption || ""}\n${info.name}`;
+  const parsed = parseMediaTitle(rawSearchText);
+  const mi = await extractMediaInfo(env, info, post.caption);
+  const meta = await fetchMovieMeta(env, rawSearchText, parsed);
 
-  const postText = lines.join("\n");
-
-  // 4. Build Inline Buttons (Get File + IMDb / TMDb links if found)
-  const keyboard = [[
-    { text: "📥 Get File", url: `https://t.me/${me.result.username}?start=f${rowId}` },
-  ]];
-  const extLinks = [];
+  // Build unique group key so 480p, 720p, 1080p, 2160p of the same Movie (or TV Episode) merge into 1 post
+  const epSuffix = parsed.isTv && parsed.season ? `_s${parsed.season}e${parsed.episode || 0}` : "";
+  let baseKey = "";
   if (meta && meta.imdbId) {
-    extLinks.push({ text: "⭐ IMDb", url: `https://www.imdb.com/title/${meta.imdbId}/` });
+    baseKey = `imdb_${meta.imdbId}`;
+  } else if (meta && meta.tmdbId) {
+    baseKey = `tmdb_${meta.mediaType}_${meta.tmdbId}`;
+  } else {
+    const slug = (parsed.query || title).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 50);
+    baseKey = `raw_${slug}_${parsed.year || "na"}`;
   }
-  if (meta && meta.tmdbId) {
-    extLinks.push({ text: "🎬 TMDb", url: `https://www.themoviedb.org/${meta.mediaType}/${meta.tmdbId}` });
+  const groupKey = `${dest[0].chat_id}:${baseKey}${epSuffix}`;
+
+  const newItem = {
+    rowId,
+    quality: mi.quality,
+    qOrder: mi.qOrder,
+    size: info.file.file_size || 0,
+    shortCodec: mi.shortCodec,
+    videoTag: mi.videoTag,
+    audioLangs: mi.audioLangs,
+    audioCodecStr: mi.audioCodecStr,
+    fullAudio: mi.fullAudio,
+    subtitles: mi.subtitles,
+    duration: mi.duration,
+    container: mi.container,
+  };
+
+  const groupEnabled = (await getSetting(env, "group_qualities")) !== "0";
+  const existing = groupEnabled
+    ? await env.DB.prepare("SELECT * FROM media_posts WHERE group_key = ?").bind(groupKey).first()
+    : null;
+
+  // If a post for this movie already exists in the channel, add the new quality button & update MediaInfo!
+  if (existing && String(existing.chat_id) === String(dest[0].chat_id)) {
+    let items = [];
+    try { items = JSON.parse(existing.items_json || "[]"); } catch (e) { items = []; }
+
+    const idx = items.findIndex((x) => x.rowId === rowId || (x.quality === newItem.quality && x.shortCodec === newItem.shortCodec && Math.abs(x.size - newItem.size) < 5 * 1024 * 1024));
+    if (idx >= 0) items[idx] = newItem;
+    else items.push(newItem);
+
+    let savedMeta = meta;
+    if (!savedMeta && existing.meta_json) {
+      try { savedMeta = JSON.parse(existing.meta_json); } catch (e) {}
+    }
+
+    const built = await buildGroupedMediaMessage(env, savedMeta, parsed, title, items);
+    const editMethod = existing.has_photo ? "editMessageCaption" : "editMessageText";
+    const editPayload = {
+      chat_id: existing.chat_id,
+      message_id: existing.message_id,
+      parse_mode: "HTML",
+      reply_markup: built.markup,
+      [existing.has_photo ? "caption" : "text"]: built.postText,
+    };
+
+    const edited = await tg(env, editMethod, editPayload);
+    if (edited.ok || (edited.description && /message is not modified/i.test(edited.description))) {
+      await env.DB.prepare(
+        "UPDATE media_posts SET items_json = ?, meta_json = ?, updated = ? WHERE group_key = ?"
+      ).bind(JSON.stringify(items), savedMeta ? JSON.stringify(savedMeta) : existing.meta_json, Date.now(), groupKey).run();
+      return;
+    }
+    // If the old channel post was manually deleted from the channel, fall through and create a fresh post containing all qualities!
+    console.log("Could not edit existing post, creating a fresh combined post:", edited.description);
   }
-  if (extLinks.length) keyboard.push(extLinks);
 
-  const markup = { inline_keyboard: keyboard };
+  // Create a brand new post (or replacement post if the old one was deleted)
+  const items = [newItem];
+  const built = await buildGroupedMediaMessage(env, meta, parsed, title, items);
 
-  // 5. Choose Cover Image: Saved custom cover -> TMDb/IMDb Poster -> Video Thumbnail
   const thumb = info.file.thumbnail || info.file.thumb;
-  const savedCover = await getSetting(env, info.kind === "pdf" ? "cover_pdf" : "cover_lecture");
-  const cover = savedCover || (meta && meta.poster) || (thumb ? thumb.file_id : null);
+  const savedCover = await getSetting(env, "cover_lecture");
+  // Priority: Official TMDb/IMDb Poster -> Custom Fallback Cover -> Video Thumbnail
+  const cover = (meta && meta.poster) || savedCover || (thumb ? thumb.file_id : null);
+
+  let postedMsg = null;
+  let hasPhoto = 0;
 
   if (cover) {
     const sent = await tg(env, "sendPhoto", {
       chat_id: dest[0].chat_id,
       photo: cover,
-      caption: postText,
+      caption: built.postText,
       parse_mode: "HTML",
-      reply_markup: markup,
+      reply_markup: built.markup,
     });
-    if (sent.ok) return;
-    console.log("Cover failed, posting without it:", JSON.stringify(sent));
+    if (sent.ok) {
+      postedMsg = sent.result;
+      hasPhoto = 1;
+    } else {
+      console.log("Cover failed, posting without it:", JSON.stringify(sent));
+    }
   }
 
-  const posted = await tg(env, "sendMessage", {
-    chat_id: dest[0].chat_id,
-    text: postText,
-    parse_mode: "HTML",
-    reply_markup: markup,
-  });
-  if (!posted.ok) {
-    await env.DB.prepare("DELETE FROM files WHERE id = ?").bind(rowId).run();
-    await alertOwner(env, `post${dest[0].chat_id}`,
-      `I couldn't post "${title}" to "${dest[0].title}": ${posted.description}. Check that I'm an admin there with the Post Messages permission, then upload the file again.`);
+  if (!postedMsg) {
+    const posted = await tg(env, "sendMessage", {
+      chat_id: dest[0].chat_id,
+      text: built.postText,
+      parse_mode: "HTML",
+      reply_markup: built.markup,
+    });
+    if (posted.ok) {
+      postedMsg = posted.result;
+    } else {
+      await env.DB.prepare("DELETE FROM files WHERE id = ?").bind(rowId).run();
+      await alertOwner(env, `post${dest[0].chat_id}`,
+        `I couldn't post "${title}" to "${dest[0].title}": ${posted.description}. Check that I'm an admin there with the Post Messages permission.`);
+      return;
+    }
+  }
+
+  if (groupEnabled && postedMsg) {
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO media_posts (group_key, chat_id, message_id, has_photo, meta_json, items_json, updated) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(
+      groupKey,
+      String(dest[0].chat_id),
+      postedMsg.message_id,
+      hasPhoto,
+      meta ? JSON.stringify(meta) : null,
+      JSON.stringify(items),
+      Date.now()
+    ).run();
   }
 }
 
@@ -2380,6 +2714,16 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     APP_ORIGIN = url.origin;
+
+    // Anti-Copyright Redirect Shield: /get/f123 -> bounces user to current active Telegram bot
+    if (request.method === "GET" && url.pathname.startsWith("/get/")) {
+      const token = url.pathname.slice(5).replace(/[^A-Za-z0-9_-]/g, "");
+      const username = await getBotUsername(env);
+      if (username && token) {
+        return Response.redirect(`https://t.me/${username}?start=${token}`, 302);
+      }
+      return new Response("Bot link not ready yet.", { status: 404 });
+    }
 
     if (request.method === "GET" && url.pathname === "/app") {
       return new Response(APP_HTML, {
