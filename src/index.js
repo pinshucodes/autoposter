@@ -1,4 +1,4 @@
-// Autoposter Bot - Multi-Quality Movie Grouping + Deep MediaInfo + Anti-Copyright Shield
+// Autoposter Bot - Movie & Series Season Batching + Anti-Bypass Shortlink Shield + IMDb/TMDb/MediaInfo
 // Runs on Cloudflare Workers + D1 database.
 //
 // Secrets (Settings > Variables and Secrets): BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET
@@ -30,21 +30,35 @@ async function tg(env, method, data, retried) {
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-// ---------- Auto-create new table for Multi-Quality Grouped Posts ----------
+// ---------- Auto-create tables for Multi-Quality & Series Season Batches ----------
 let SCHEMA_READY = false;
 async function ensureExtraTables(env) {
   if (SCHEMA_READY) return;
   try {
-    await env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS media_posts (" +
-      "group_key TEXT PRIMARY KEY, " +
-      "chat_id TEXT, " +
-      "message_id INTEGER, " +
-      "has_photo INTEGER, " +
-      "meta_json TEXT, " +
-      "items_json TEXT, " +
-      "updated INTEGER)"
-    ).run();
+    await env.DB.batch([
+      env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS media_posts (" +
+        "group_key TEXT PRIMARY KEY, " +
+        "chat_id TEXT, " +
+        "message_id INTEGER, " +
+        "has_photo INTEGER, " +
+        "meta_json TEXT, " +
+        "items_json TEXT, " +
+        "updated INTEGER)"
+      ),
+      env.DB.prepare(
+        "CREATE TABLE IF NOT EXISTS batches (" +
+        "batch_id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+        "group_key TEXT, " +
+        "quality TEXT, " +
+        "title TEXT, " +
+        "items_json TEXT, " +
+        "updated INTEGER)"
+      ),
+      env.DB.prepare(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_gk_q ON batches(group_key, quality)"
+      ),
+    ]);
     SCHEMA_READY = true;
   } catch (err) {
     console.log("Table init note:", err);
@@ -58,8 +72,8 @@ const ROLES = {
     help: "Channels or groups where you upload your files. I watch these for new files. (For a group, make me an admin so I can see the files. Only group admins can add files.)",
   },
   lectures: {
-    emoji: "🎬", name: "Movies / Videos Channel", multi: false,
-    help: "The main channel where video/movie posts will be published and auto-updated with new qualities.",
+    emoji: "🎬", name: "Movies / Series Channel", multi: false,
+    help: "The main channel where movie and series posts will be published and auto-updated.",
   },
   pdfs: {
     emoji: "📄", name: "PDFs Channel", multi: false,
@@ -120,6 +134,11 @@ async function getFileRow(env, id) {
   return env.DB.prepare("SELECT * FROM files WHERE id = ?").bind(id).first();
 }
 
+async function getBatchRow(env, batchId) {
+  await ensureExtraTables(env);
+  return env.DB.prepare("SELECT * FROM batches WHERE batch_id = ?").bind(batchId).first();
+}
+
 function formatSize(bytes) {
   if (!bytes) return "Unknown";
   const mb = bytes / (1024 * 1024);
@@ -151,7 +170,6 @@ function makeTitle(post, name) {
   return cleaned || "Untitled";
 }
 
-// Cache bot username so we don't call getMe repeatedly
 let CACHED_BOT_USERNAME = null;
 async function getBotUsername(env) {
   if (CACHED_BOT_USERNAME) return CACHED_BOT_USERNAME;
@@ -164,7 +182,6 @@ async function getBotUsername(env) {
   return (await getSetting(env, "bot_username")) || "";
 }
 
-// Generates a copyright-safe link that routes through your Worker if enabled
 async function makeDeepLink(env, startParam) {
   const shieldOn = (await getSetting(env, "shield_redirect")) !== "0"; // ON by default
   if (shieldOn && APP_ORIGIN) {
@@ -174,9 +191,10 @@ async function makeDeepLink(env, startParam) {
   return `https://t.me/${username}?start=${startParam}`;
 }
 
-async function sendFileToUser(env, chatId, row) {
+// Sends a single file to the user (unlocked by default so they can share/forward within 5 mins)
+async function sendFileToUser(env, chatId, row, skipNotice) {
   const asVideo = row.send_as === "video";
-  const protect = (await getSetting(env, "protect_files")) === "1";
+  const protect = (await getSetting(env, "protect_files")) === "1"; // OFF by default so users can forward/share
   const sent = await tg(env, asVideo ? "sendVideo" : "sendDocument", {
     chat_id: chatId,
     [asVideo ? "video" : "document"]: row.file_id,
@@ -187,37 +205,89 @@ async function sendFileToUser(env, chatId, row) {
 
   if (!sent.ok) {
     console.log("Send file failed:", sent.error_code, sent.description);
-    if (sent.error_code !== 403) {
+    if (sent.error_code !== 403 && !skipNotice) {
       await tg(env, "sendMessage", {
         chat_id: chatId,
         text: "⚠️ I couldn't send the file right now. Please try again in a minute.",
       });
       await alertOwner(env, `send${row.id}`, `Could not send file #${row.id} "${row.title}": ${sent.description}`);
     }
-    return false;
+    return null;
   }
 
   await env.DB.prepare("INSERT INTO downloads (user_id, file_row_id, day) VALUES (?, ?, ?)")
     .bind(String(chatId), row.id, dayString(0)).run();
 
-  // Auto-delete: default to 10 minutes if not set so copyright bots can't scan chat history
+  // Default auto-delete is 5 minutes so users can forward/share before it vanishes
   const rawMins = await getSetting(env, "delete_minutes");
-  const mins = rawMins === null ? 10 : parseInt(rawMins, 10);
-  if (!mins) return true;
+  const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
+  if (!mins) return sent.result.message_id;
 
-  const notice = await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: `⏳ <b>Auto-Delete Notice:</b> Due to copyright protection, this file will be deleted here in <b>${formatDelay(mins)}</b>.${protect ? "" : " Please forward or save it immediately."}`,
-    parse_mode: "HTML",
-  });
   const deleteAt = Date.now() + mins * 60 * 1000;
   const ids = [sent.result.message_id];
-  if (notice.ok) ids.push(notice.result.message_id);
+
+  if (!skipNotice) {
+    const notice = await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `⏳ <b>Auto-Delete Notice:</b> This file will be deleted in <b>${formatDelay(mins)}</b>. Forward or share it to your Saved Messages now!`,
+      parse_mode: "HTML",
+    });
+    if (notice.ok) ids.push(notice.result.message_id);
+  }
+
   for (const id of ids) {
     await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
       .bind(String(chatId), id, deleteAt).run();
   }
-  return true;
+  return sent.result.message_id;
+}
+
+// Sends Jarvis-style Season Batch Episode Picker inside the bot
+async function sendBatchMenuToUser(env, chatId, batch) {
+  let items = [];
+  try { items = JSON.parse(batch.items_json || "[]"); } catch (e) { items = []; }
+  items.sort((a, b) => (a.season || 1) - (b.season || 1) || (a.episode || 0) - (b.episode || 0));
+
+  if (!items.length) {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, no episodes found in this batch." });
+    return;
+  }
+
+  const lines = [
+    `🗂 <b>${esc(batch.title)} — ${esc(batch.quality)}</b>`,
+    `🔍 <b>Total Episodes:</b> ${items.length}`,
+    "",
+  ];
+
+  const buttons = [
+    [{ text: `📦 Send All ${items.length} Episodes (${batch.quality})`, callback_data: `ball:${batch.batch_id}` }],
+  ];
+
+  for (const ep of items) {
+    const sStr = `S${String(ep.season || 1).padStart(2, "0")}`;
+    const eStr = ep.episode ? `E${String(ep.episode).padStart(2, "0")}` : "EP";
+    const langTag = ep.audioLangs && ep.audioLangs.length ? ` • ${ep.audioLangs.slice(0, 2).join(" + ")}` : "";
+    lines.push(`📂 <b>${sStr} • ${eStr} • ${esc(batch.quality)}${esc(langTag)}</b> [${formatSize(ep.size)}]`);
+    buttons.push([{
+      text: `⬇️ GET ${sStr} • ${eStr} • ${batch.quality} [${formatSize(ep.size)}]`,
+      callback_data: `bep:${ep.rowId}`,
+    }]);
+  }
+
+  const sent = await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons.slice(0, 98) },
+  });
+
+  // Also auto-delete the batch menu after 5 minutes to keep chat clean
+  const rawMins = await getSetting(env, "delete_minutes");
+  const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
+  if (mins && sent.ok) {
+    await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
+      .bind(String(chatId), sent.result.message_id, Date.now() + mins * 60 * 1000).run();
+  }
 }
 
 // Runs every minute (Cron Trigger)
@@ -248,7 +318,7 @@ async function setSetting(env, key, value) {
   await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(key, value).run();
 }
 
-// ---------- Shortlink ----------
+// ---------- Shortlink & Anti-Bypass Verification ----------
 async function shortlinkReady(env) {
   const on = await getSetting(env, "shortlink_enabled");
   const domain = await getSetting(env, "shortlink_domain");
@@ -272,25 +342,53 @@ async function shortenUrl(env, longUrl) {
   return null;
 }
 
-async function sendVerifyLink(env, chatId, userId, row) {
+// Anti-Bypass Verification:
+// Uses a Telegram Mini App (web_app) button so long-pressing NEVER shows a URL or "Copy" option!
+// Plus adds the "How to Verify" tutorial button right below it.
+// Negative file_row_id (-batchId) represents a Series Season Batch!
+async function sendVerifyLink(env, chatId, userId, targetId, displayTitle) {
   const token = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
   await env.DB.prepare("DELETE FROM tokens WHERE created < ?").bind(Date.now() - 24 * 3600 * 1000).run();
   await env.DB.prepare("INSERT INTO tokens (token, user_id, file_row_id, created) VALUES (?, ?, ?, ?)")
-    .bind(token, String(userId), row.id, Date.now()).run();
+    .bind(token, String(userId), targetId, Date.now()).run();
 
-  const username = await getBotUsername(env);
-  const short = await shortenUrl(env, `https://t.me/${username}?start=v${token}`);
-  if (!short) {
-    await alertOwner(env, "shortlink",
-      "The shortlink service isn't responding, or the API key is wrong. Users are getting files WITHOUT verification until it's fixed. Check /status.");
-    await sendFileToUser(env, chatId, row);
-    return;
+  const tutorialUrl = await getSetting(env, "tutorial_url");
+  const keyboard = [];
+
+  if (APP_ORIGIN) {
+    // WebApp button: impossible to long-press & copy URL in Telegram!
+    keyboard.push([{ text: "🛡️ Verify Now & Unlock File", web_app: { url: `${APP_ORIGIN}/verify?t=${token}` } }]);
+  } else {
+    const username = await getBotUsername(env);
+    const short = await shortenUrl(env, `https://t.me/${username}?start=v${token}`);
+    if (!short) {
+      await alertOwner(env, "shortlink", "Shortlink failed. Sending without verification.");
+      if (targetId < 0) {
+        const b = await getBatchRow(env, -targetId);
+        if (b) await sendBatchMenuToUser(env, chatId, b);
+      } else {
+        const row = await getFileRow(env, targetId);
+        if (row) await sendFileToUser(env, chatId, row);
+      }
+      return;
+    }
+    keyboard.push([{ text: "🛡️ Verify Now & Unlock File", url: short }]);
   }
+
+  if (tutorialUrl) {
+    keyboard.push([{ text: "🎬 How to Verify (Tutorial)", url: tutorialUrl }]);
+  }
+
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `🔗 <b>Verify to get your file</b>\n\n<b>${esc(row.title)}</b>\n\nTap the button below and complete the short step. You'll be brought back here and I'll send the file.`,
+    text:
+      `🛡️ <b>Secure Verification Required</b>\n\n` +
+      `🎬 <b>${esc(displayTitle)}</b>\n\n` +
+      `Complete the quick verification below to unlock your selected content.\n` +
+      `<i>🔒 Protected link — copying or external bypass tools are blocked.</i>`,
     parse_mode: "HTML",
-    reply_markup: { inline_keyboard: [[{ text: "✅ Verify & Get File", url: short }]] },
+    protect_content: true, // Locks the verification message from forwarding/copying
+    reply_markup: { inline_keyboard: keyboard },
   });
 }
 
@@ -302,7 +400,7 @@ async function getMissingChannels(env, userId) {
     if (!r.ok) {
       if (/user not found|PARTICIPANT_ID_INVALID/i.test(r.description || "")) return c;
       await alertOwner(env, `fs${c.chat_id}`,
-        `ForceSub can't check "${c.title}": ${r.description}. Make sure I'm still an admin there. Until then users are NOT being checked for that channel.`);
+        `ForceSub can't check "${c.title}": ${r.description}. Make sure I'm still an admin there.`);
       return null;
     }
     const st = r.result.status;
@@ -324,16 +422,17 @@ async function ensureLink(env, c) {
   if (link) {
     await env.DB.prepare("UPDATE channels SET link = ? WHERE role = 'forcesub' AND chat_id = ?").bind(link, c.chat_id).run();
   } else {
-    await alertOwner(env, `lnk${c.chat_id}`, `I have no join link for ForceSub channel "${c.title}". Give me the Invite Users permission there.`);
+    await alertOwner(env, `lnk${c.chat_id}`, `I have no join link for ForceSub channel "${c.title}". Give me Invite Users permission.`);
   }
   return link;
 }
 
+// Delivers a single file ( checks ForceSub -> Shortlink -> Sends File )
 async function deliverFile(env, chatId, userId, row, verified) {
   const missing = await getMissingChannels(env, userId);
   if (!missing.length) {
     if (!verified && (await shortlinkReady(env)) && !(await hasActiveSub(env, userId))) {
-      await sendVerifyLink(env, chatId, userId, row);
+      await sendVerifyLink(env, chatId, userId, row.id, row.title);
       return;
     }
     await sendFileToUser(env, chatId, row);
@@ -353,16 +452,41 @@ async function deliverFile(env, chatId, userId, row, verified) {
   });
 }
 
+// Delivers a Series Season Batch ( checks ForceSub -> Shortlink -> Opens Jarvis-style Episode List )
+async function deliverBatch(env, chatId, userId, batch, verified) {
+  const missing = await getMissingChannels(env, userId);
+  if (!missing.length) {
+    if (!verified && (await shortlinkReady(env)) && !(await hasActiveSub(env, userId))) {
+      await sendVerifyLink(env, chatId, userId, -batch.batch_id, `${batch.title} (${batch.quality})`);
+      return;
+    }
+    await sendBatchMenuToUser(env, chatId, batch);
+    return;
+  }
+  const buttons = [];
+  for (const c of missing) {
+    const link = await ensureLink(env, c);
+    if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
+  }
+  buttons.push([{ text: "✅ I've Joined", callback_data: `chkb:${batch.batch_id}` }]);
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "🔐 To access this season batch, please join the channel(s) below, then tap <b>I've Joined</b>.",
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
 // ---------- Menus ----------
 const MAIN_MENU = {
   text: "⚙️ <b>Settings</b>\n\nSelect what you want to configure:",
   buttons: [
     [{ text: "📥 Source Channels", callback_data: "role:source" }],
-    [{ text: "🎬 Movies / Videos Channel", callback_data: "role:lectures" }],
+    [{ text: "🎬 Movies / Series Channel", callback_data: "role:lectures" }],
     [{ text: "📄 PDFs Channel", callback_data: "role:pdfs" }],
     [{ text: "🔐 ForceSub Settings", callback_data: "role:forcesub" }],
     [{ text: "🎬 IMDb, TMDb, Grouping & Shield", callback_data: "meta:menu" }],
-    [{ text: "🔗 Shortlink Settings", callback_data: "sl:menu" }],
+    [{ text: "🔗 Shortlink & Tutorial Settings", callback_data: "sl:menu" }],
     [{ text: "🗑️ File Delete Settings", callback_data: "del:menu" }],
     [{ text: "🖼️ Cover Images", callback_data: "cov:menu" }],
     [{ text: "💳 Payments", callback_data: "pay:menu" }],
@@ -456,10 +580,9 @@ function formatDelay(mins) {
 
 async function buildDeleteMenu(env, note) {
   const rawMins = await getSetting(env, "delete_minutes");
-  const mins = rawMins === null ? 10 : parseInt(rawMins, 10);
-  let text = "🗑️ <b>File Delete Settings (Anti-Copyright)</b>\n\n" +
-    "Files sent by the bot are automatically deleted from the user's private chat after the time you choose. " +
-    "Keeping this around 5–15 minutes strongly protects your bot from copyright strikes.\n\n" +
+  const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
+  let text = "🗑️ <b>File Delete Settings</b>\n\n" +
+    "Files sent by the bot can be shared/forwarded by users for the time you choose, and then are automatically deleted from the chat.\n\n" +
     `Current: <b>${formatDelay(mins)}</b>`;
   if (note) text += `\n\n${note}`;
 
@@ -493,27 +616,27 @@ async function buildMetaMenu(env, note) {
   const miOn = (await getSetting(env, "mediainfo_enabled")) !== "0"; // ON by default
   const groupOn = (await getSetting(env, "group_qualities")) !== "0"; // ON by default
   const shieldOn = (await getSetting(env, "shield_redirect")) !== "0"; // ON by default
-  const protectOn = (await getSetting(env, "protect_files")) === "1"; // OFF by default
+  const protectOn = (await getSetting(env, "protect_files")) === "1"; // OFF by default so users can forward/share
   const tmdbKey = await getSetting(env, "tmdb_key");
   const omdbKey = await getSetting(env, "omdb_key");
 
-  let text = "🎬 <b>IMDb, TMDb, Multi-Quality & Copyright Shield</b>\n\n" +
-    "• <b>Combine Qualities:</b> Merges 480p, 720p, 1080p, 4K uploads of the same movie into ONE post with multiple buttons.\n" +
-    "• <b>MediaInfo:</b> Extracts audio languages, subtitles, codecs, resolution & bitrate.\n" +
-    "• <b>Redirect Shield:</b> Uses your Worker link on channel buttons instead of a direct bot link—protects the channel & lets you swap bots if banned.\n" +
-    "• <b>Forward Lock:</b> Blocks users from forwarding files out of the bot.\n\n" +
+  let text = "🎬 <b>IMDb, TMDb, Series Batching & Shield</b>\n\n" +
+    "• <b>Combine Qualities & Series Seasons:</b> Merges 480p, 720p, 1080p, 4K of a Movie or an entire TV Season into ONE channel post. Tapping 720p on a series opens the Jarvis-style Episode Batch list!\n" +
+    "• <b>MediaInfo:</b> Extracts audio languages, subtitles, codecs & resolution.\n" +
+    "• <b>Redirect Shield:</b> Uses Worker links on channel posts to protect your channel.\n" +
+    "• <b>Forward Lock:</b> Keep OFF so users can forward/share files within 5 minutes.\n\n" +
     `🎬 IMDb/TMDb Info: ${metaOn ? "✅ ON" : "❌ OFF"}\n` +
-    `🗂 Combine Qualities (1 Post): ${groupOn ? "✅ ON" : "❌ OFF"}\n` +
+    `🗂 Combine Qualities & Seasons: ${groupOn ? "✅ ON" : "❌ OFF"}\n` +
     `📊 Deep MediaInfo (Audio/Subs): ${miOn ? "✅ ON" : "❌ OFF"}\n` +
     `🛡️ Worker Redirect Shield: ${shieldOn ? "✅ ON" : "❌ OFF"}\n` +
-    `🔒 Lock File Forwarding: ${protectOn ? "✅ ON" : "❌ OFF"}\n\n` +
+    `🔒 Lock File Forwarding: ${protectOn ? "✅ ON (No Share)" : "❌ OFF (Users Can Share)"}\n\n` +
     `TMDb Key: ${tmdbKey ? "<code>" + esc(tmdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n` +
     `OMDb (IMDb) Key: ${omdbKey ? "<code>" + esc(omdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}`;
   if (note) text += `\n\n${note}`;
 
   const buttons = [
     [{ text: metaOn ? "🎬 IMDb/TMDb: ON" : "🎬 IMDb/TMDb: OFF (Tap to ON)", callback_data: "meta:toggle" }],
-    [{ text: groupOn ? "🗂 Combine Qualities: ON" : "🗂 Combine Qualities: OFF", callback_data: "meta:grouptoggle" }],
+    [{ text: groupOn ? "🗂 Combine Qualities/Seasons: ON" : "🗂 Combine Qualities/Seasons: OFF", callback_data: "meta:grouptoggle" }],
     [{ text: miOn ? "📊 MediaInfo (Audio/Subs): ON" : "📊 MediaInfo: OFF", callback_data: "meta:mitoggle" }],
     [
       { text: shieldOn ? "🛡️ Link Shield: ON" : "🛡️ Link Shield: OFF", callback_data: "meta:shieldtoggle" },
@@ -528,24 +651,28 @@ async function buildMetaMenu(env, note) {
   return { text, buttons };
 }
 
-// ---------- Shortlink settings menu ----------
+// ---------- Shortlink & Tutorial settings menu ----------
 async function buildShortlinkMenu(env, note) {
   const domain = await getSetting(env, "shortlink_domain");
   const key = await getSetting(env, "shortlink_key");
   const on = (await getSetting(env, "shortlink_enabled")) === "1";
+  const tut = await getSetting(env, "tutorial_url");
 
-  let text = "🔗 <b>Shortlink Settings</b>\n\nUsers pass a shortlink before they get a file.\n\n";
-  text += `Status: ${on ? "✅ ON" : "❌ OFF"}\n`;
+  let text = "🔗 <b>Shortlink & Tutorial Settings</b>\n\n" +
+    "Users pass a copy-protected shortlink before they get a file or season batch.\n\n";
+  text += `Status: ${on ? "✅ ON (Anti-Copy Mini App Shield Active)" : "❌ OFF"}\n`;
   text += `Domain: ${domain ? esc(domain) : "<i>not set</i>"}\n`;
-  text += `API key: ${key ? "<code>" + esc(key.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}`;
+  text += `API key: ${key ? "<code>" + esc(key.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n`;
+  text += `How to Verify Tutorial: ${tut ? esc(tut) : "<i>not set</i>"}`;
   if (note) text += `\n\n${note}`;
 
   const buttons = [
     [{ text: on ? "🔴 Turn OFF" : "🟢 Turn ON", callback_data: "sl:toggle" }],
-    [{ text: "🌐 Set Domain", callback_data: "sl:domain" }],
-    [{ text: "🔑 Set API Key", callback_data: "sl:key" }],
-    ...BACK_BUTTON,
+    [{ text: "🌐 Set Domain", callback_data: "sl:domain" }, { text: "🔑 Set API Key", callback_data: "sl:key" }],
+    [{ text: "🎬 Set Tutorial Link (How to Verify)", callback_data: "sl:tutorial" }],
   ];
+  if (tut) buttons.push([{ text: "🗑 Remove Tutorial Link", callback_data: "sl:rmtut" }]);
+  buttons.push(...BACK_BUTTON);
   return { text, buttons };
 }
 
@@ -660,7 +787,7 @@ async function handleSettingInput(env, msg, field) {
   if (field === "tmdb_key" || field === "omdb_key") {
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
     await setSetting(env, field, value);
-    await setSetting(env, "meta_enabled", "1"); // Auto-enable once key is added
+    await setSetting(env, "meta_enabled", "1");
     await clearState(env, userId);
     const mmenu = await buildMetaMenu(env, "✅ API key saved & IMDb/TMDb enabled!");
     await tg(env, "sendMessage", {
@@ -668,6 +795,25 @@ async function handleSettingInput(env, msg, field) {
       text: mmenu.text,
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: mmenu.buttons },
+    });
+    return;
+  }
+  if (field === "tutorial_url") {
+    if (!/^https?:\/\/\S+/i.test(value)) {
+      await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: "Please send a valid link starting with https:// (like https://t.me/yourchannel/123), or /cancel.",
+      });
+      return;
+    }
+    await setSetting(env, "tutorial_url", value);
+    await clearState(env, userId);
+    const smenu = await buildShortlinkMenu(env, "✅ Tutorial link saved!");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: smenu.text,
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: smenu.buttons },
     });
     return;
   }
@@ -740,7 +886,7 @@ async function checkChannel(env, ref, role) {
 
 // ---------- Users, stats, post and broadcast ----------
 const TZ_OFFSET_MIN = 330;
-const MIN_VERIFY_SECONDS = 8;
+const MIN_VERIFY_SECONDS = 10;
 const RATE_MAX = 8;
 const RATE_WINDOW_MS = 10000;
 
@@ -996,16 +1142,16 @@ async function sendStatus(env, chatId) {
 
   if ((await getSetting(env, "shortlink_enabled")) === "1") {
     const test = await shortenUrl(env, "https://t.me/telegram");
-    lines.push(test ? "✅ Shortlink: working" : "⚠️ Shortlink: NOT working (users skip verification)");
+    lines.push(test ? "✅ Shortlink: working (Anti-Copy Shield ON)" : "⚠️ Shortlink: NOT working (users skip verification)");
   } else {
     lines.push("➖ Shortlink: off");
   }
   const metaOn = (await getSetting(env, "meta_enabled")) === "1";
   lines.push(metaOn ? "✅ IMDb/TMDb: on" : "➖ IMDb/TMDb: off");
   const groupOn = (await getSetting(env, "group_qualities")) !== "0";
-  lines.push(groupOn ? "✅ Multi-Quality Grouping: on" : "➖ Multi-Quality Grouping: off");
+  lines.push(groupOn ? "✅ Multi-Quality & Series Batching: on" : "➖ Grouping: off");
   const rawMins = await getSetting(env, "delete_minutes");
-  const mins = rawMins === null ? 10 : parseInt(rawMins, 10);
+  const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
   lines.push(`🛡️ Auto-delete: ${formatDelay(mins)}`);
 
   const upiId = await getSetting(env, "upi_id");
@@ -1128,6 +1274,22 @@ async function handleApi(request, env, path) {
   let body = {};
   try { body = await request.json(); } catch (err) { /* empty body is fine */ }
 
+  // Anti-Bypass Shortlink Generator inside Telegram Mini App
+  if (path === "/api/verify-link") {
+    const tok = String(body.token || "").trim();
+    const t = await env.DB.prepare("SELECT token, user_id, file_row_id, created FROM tokens WHERE token = ?")
+      .bind(tok).first();
+    if (!t || String(t.user_id) !== uid || Date.now() - t.created > 3600 * 1000) {
+      return json({ error: "This verification session has expired. Please tap the button in the bot again." }, 400);
+    }
+    // Reset timer to the exact moment the user opened the verification mini-app
+    await env.DB.prepare("UPDATE tokens SET created = ? WHERE token = ?").bind(Date.now(), tok).run();
+    const username = await getBotUsername(env);
+    const short = await shortenUrl(env, `https://t.me/${username}?start=v${tok}`);
+    if (!short) return json({ error: "Verification server is busy. Please try again." }, 500);
+    return json({ url: short });
+  }
+
   const upiId = await getSetting(env, "upi_id");
 
   if (path === "/api/me") {
@@ -1217,6 +1379,71 @@ async function handleApi(request, env, path) {
 
   return json({ error: "Not found" }, 404);
 }
+
+// ---------- Anti-Bypass Verification Mini App Page ----------
+const VERIFY_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Secure Verification</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#0f172a);--text:var(--tg-theme-text-color,#f8fafc);--hint:var(--tg-theme-hint-color,#94a3b8);--accent:var(--tg-theme-button-color,#2563eb);--accent-text:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#1e293b)}
+*{box-sizing:border-box;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+body{margin:0;padding:24px 18px;background:var(--bg);color:var(--text);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;text-align:center;display:flex;flex-direction:column;justify-content:center;min-height:92vh}
+.card{background:var(--card);border-radius:18px;padding:24px 18px;box-shadow:0 8px 24px rgba(0,0,0,0.25)}
+.icon{font-size:44px;margin-bottom:8px}
+h1{font-size:20px;margin:6px 0}
+p{color:var(--hint);font-size:14px;margin:8px 0 20px}
+.btn{display:block;width:100%;padding:14px;border:0;border-radius:12px;background:var(--accent);color:var(--accent-text);font:inherit;font-weight:600;cursor:pointer}
+.btn:disabled{opacity:0.6}
+.err{color:#ef4444;font-size:14px;margin-top:12px}
+</style></head>
+<body oncontextmenu="return false;">
+<div class="card" id="box">
+  <div class="icon">🛡️</div>
+  <h1 id="title">Preparing Secure Verification...</h1>
+  <p id="desc">Please wait a moment while we generate your one-time verification session.</p>
+  <button class="btn" id="go" style="display:none">🚀 Continue to Verification</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+var tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+var params = new URLSearchParams(location.search);
+var token = params.get("t") || "";
+var titleEl = document.getElementById("title");
+var descEl = document.getElementById("desc");
+var btnEl = document.getElementById("go");
+var errEl = document.getElementById("err");
+
+if (!tg || !tg.initData) {
+  titleEl.textContent = "🚫 Access Denied";
+  descEl.textContent = "This verification link can only be opened directly inside the official Telegram app. External browsers and bypass tools are blocked.";
+} else {
+  fetch("/api/verify-link", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Init-Data": tg.initData },
+    body: JSON.stringify({ token: token })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.error || !d.url) {
+      titleEl.textContent = "⚠️ Session Expired";
+      descEl.textContent = d.error || "Please return to the bot and tap the button again.";
+      return;
+    }
+    titleEl.textContent = "🛡️ Security Check Ready";
+    descEl.textContent = "Tap the button below and complete the short step to unlock your file automatically.";
+    btnEl.style.display = "block";
+    btnEl.onclick = function() {
+      btnEl.disabled = true;
+      location.replace(d.url);
+    };
+    setTimeout(function() { location.replace(d.url); }, 600);
+  }).catch(function() {
+    errEl.textContent = "Network error. Please close and try again.";
+  });
+}
+</script></body></html>`;
 
 // ---------- Telegram Stars ----------
 async function handlePreCheckout(q, env) {
@@ -1313,7 +1540,7 @@ async function buildPayMenu(env, note) {
   return { text, buttons };
 }
 
-// ---------- The Mini App page ----------
+// ---------- The Mini App page (Skip Ads / Premium) ----------
 const APP_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -1540,6 +1767,7 @@ async function handleMessage(msg, env) {
   }
 
   if (text.startsWith("/start")) {
+    // 1. Returning from Shortlink Verification: /start v<token>
     const tok = text.match(/^\/start v([A-Za-z0-9]+)/);
     if (tok) {
       const t = await env.DB.prepare("SELECT file_row_id, user_id, created FROM tokens WHERE token = ?")
@@ -1548,7 +1776,7 @@ async function handleMessage(msg, env) {
       if (!t || String(t.user_id) !== userId || !fresh) {
         await tg(env, "sendMessage", {
           chat_id: chatId,
-          text: "⚠️ This verification link is invalid or has expired. Please tap the quality button on the channel post again.",
+          text: "⚠️ This verification link is invalid or has expired. Please tap the button on the channel post again.",
           parse_mode: "HTML",
         });
         return;
@@ -1556,36 +1784,61 @@ async function handleMessage(msg, env) {
       if (Date.now() - t.created < MIN_VERIFY_SECONDS * 1000) {
         await tg(env, "sendMessage", {
           chat_id: chatId,
-          text: "⚠️ Verification not completed. Please finish the steps on the link first, then come back.",
+          text: "⚠️ Bypass detected! Please complete the verification steps properly without skipping.",
         });
         return;
       }
       const used = await env.DB.prepare("DELETE FROM tokens WHERE token = ?").bind(tok[1]).run();
       if (!used.meta.changes) return;
       await env.DB.prepare("INSERT INTO verifications (user_id, file_row_id, day) VALUES (?, ?, ?)")
-        .bind(userId, t.file_row_id, dayString(0)).run();
-      const row = await getFileRow(env, t.file_row_id);
-      if (!row) {
-        await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
+        .bind(userId, Math.abs(t.file_row_id), dayString(0)).run();
+
+      // Negative file_row_id means it's a TV Series Season Batch
+      if (t.file_row_id < 0) {
+        const batch = await getBatchRow(env, -t.file_row_id);
+        if (!batch) {
+          await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that season batch is no longer available." });
+        } else {
+          await deliverBatch(env, chatId, msg.from.id, batch, true);
+        }
       } else {
-        await deliverFile(env, chatId, msg.from.id, row, true);
+        const row = await getFileRow(env, t.file_row_id);
+        if (!row) {
+          await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
+        } else {
+          await deliverFile(env, chatId, msg.from.id, row, true);
+        }
       }
       return;
     }
 
+    // 2. Opening a Series Season Quality Batch from Channel: /start b12
+    const bMatch = text.match(/^\/start b(\d+)/);
+    if (bMatch) {
+      const batch = await getBatchRow(env, Number(bMatch[1]));
+      if (!batch) {
+        await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that season batch is no longer available." });
+      } else {
+        await deliverBatch(env, chatId, msg.from.id, batch, false);
+      }
+      return;
+    }
+
+    // 3. Opening a Movie / Single File from Channel: /start f12
     const match = text.match(/^\/start f(\d+)/);
     if (match) {
       const row = await getFileRow(env, Number(match[1]));
       if (!row) {
         await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
       } else {
-        await deliverFile(env, chatId, msg.from.id, row);
+        await deliverFile(env, chatId, msg.from.id, row, false);
       }
       return;
     }
+
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: "👋 Hi! Select any quality button on our channel posts to get your file instantly.\n\nOwner can use /settings to configure me.",
+      text: "👋 Hi! Select any quality button on our channel posts to get your Movie or Series Season instantly.\n\nOwner can use /settings to configure me.",
     });
     return;
   }
@@ -1738,7 +1991,8 @@ async function handleButton(query, env) {
   const parts = query.data.split(":");
   const action = parts[0];
 
-  if (action === "chk") {
+  // User tapped an Episode button or "Send All Episodes" inside a Series Batch Menu
+  if (action === "bep" || action === "ball") {
     if (userId !== String(env.OWNER_ID)) {
       const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
       if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
@@ -1746,12 +2000,55 @@ async function handleButton(query, env) {
         return;
       }
     }
-    const row = await getFileRow(env, Number(parts[1]));
-    if (!row) {
-      await tg(env, "answerCallbackQuery", {
-        callback_query_id: query.id, text: "That file is no longer available.", show_alert: true,
-      });
+    if (action === "bep") {
+      const row = await getFileRow(env, Number(parts[1]));
+      if (!row) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Episode no longer available.", show_alert: true });
+        return;
+      }
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Sending episode..." });
+      await sendFileToUser(env, chatId, row, false);
       return;
+    }
+    if (action === "ball") {
+      const batch = await getBatchRow(env, Number(parts[1]));
+      if (!batch) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Batch no longer available.", show_alert: true });
+        return;
+      }
+      let items = [];
+      try { items = JSON.parse(batch.items_json || "[]"); } catch (e) { items = []; }
+      items.sort((a, b) => (a.season || 1) - (b.season || 1) || (a.episode || 0) - (b.episode || 0));
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `Sending ${items.length} episodes...` });
+      for (const ep of items) {
+        const row = await getFileRow(env, ep.rowId);
+        if (row) await sendFileToUser(env, chatId, row, true);
+      }
+      const rawMins = await getSetting(env, "delete_minutes");
+      const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
+      if (mins) {
+        const notice = await tg(env, "sendMessage", {
+          chat_id: chatId,
+          text: `⏳ <b>Auto-Delete Notice:</b> All episodes above will be deleted in <b>${formatDelay(mins)}</b>. Forward or share them to your Saved Messages now!`,
+          parse_mode: "HTML",
+        });
+        if (notice.ok) {
+          await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
+            .bind(String(chatId), notice.result.message_id, Date.now() + mins * 60 * 1000).run();
+        }
+      }
+      return;
+    }
+  }
+
+  // ForceSub "I've Joined" check for Single File (chk) or Series Season Batch (chkb)
+  if (action === "chk" || action === "chkb") {
+    if (userId !== String(env.OWNER_ID)) {
+      const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
+      if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+        return;
+      }
     }
     const missing = await getMissingChannels(env, query.from.id);
     if (missing.length) {
@@ -1762,7 +2059,14 @@ async function handleButton(query, env) {
     }
     await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
-    await deliverFile(env, chatId, query.from.id, row, false);
+
+    if (action === "chkb") {
+      const batch = await getBatchRow(env, Number(parts[1]));
+      if (batch) await deliverBatch(env, chatId, query.from.id, batch, false);
+    } else {
+      const row = await getFileRow(env, Number(parts[1]));
+      if (row) await deliverFile(env, chatId, query.from.id, row, false);
+    }
     return;
   }
 
@@ -1921,7 +2225,7 @@ async function handleButton(query, env) {
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: messageId,
-        text: "✏️ Send the number of minutes (1 to 2820). For example, <code>10</code> means 10 minutes.",
+        text: "✏️ Send the number of minutes (1 to 2820). For example, <code>5</code> means 5 minutes.",
         parse_mode: "HTML",
         reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "del:menu" }]] },
       });
@@ -2049,337 +2353,216 @@ async function handleButton(query, env) {
     return;
   }
 
-  // Shortlink settings
+  // Shortlink & Tutorial settings: sl:menu, sl:toggle, sl:domain, sl:key, sl:tutorial, sl:rmtut
   if (action === "sl") {
     const sub = parts[1];
-    if (sub === "domain" || sub === "key") {
-      await setState(env, userId, `set:shortlink_${sub}`);
-      const prompt = sub === "domain"
-        ? "🌐 Send your shortener's domain, like <code>example.com</code>."
-        : "🔑 Send your shortener's API key. I'll delete your message after saving it.";
+    if (sub === "domain" || sub === "key" || sub === "tutorial") {
+      const fieldMap = { domain: "shortlink_domain", key: "shortlink_key", tutorial: "tutorial_url" };
+      await setState(env, userId, `set:${fieldMap[sub]}`);
+      const prompts = {
+        domain: "🌐 Send your shortlink domain (for example: <code>gplinks.in</code> or <code>shrinkme.io</code>).",
+        key: "🔑 Send your shortlink API key. I'll delete your message right after saving it.",
+        tutorial: "🎬 Send the link to your <b>How to Verify</b> tutorial video/post (for example: <code>https://t.me/yourchannel/123</code>).",
+      };
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: messageId,
-        text: prompt,
+        text: prompts[sub],
         parse_mode: "HTML",
         reply_markup: { inline_keyboard: [[{ text: "✖️ Cancel", callback_data: "sl:menu" }]] },
       });
       return;
     }
     let note = "";
+    if (sub === "rmtut") {
+      await env.DB.prepare("DELETE FROM settings WHERE key = 'tutorial_url'").run();
+      note = "🗑 Tutorial link removed.";
+    }
     if (sub === "toggle") {
       const on = (await getSetting(env, "shortlink_enabled")) === "1";
       if (on) {
         await setSetting(env, "shortlink_enabled", "0");
-      } else if (!(await getSetting(env, "shortlink_domain")) || !(await getSetting(env, "shortlink_key"))) {
-        note = "⚠️ Set the domain and API key first.";
       } else {
-        await setSetting(env, "shortlink_enabled", "1");
+        const d = await getSetting(env, "shortlink_domain");
+        const k = await getSetting(env, "shortlink_key");
+        if (!d || !k) {
+          note = "⚠️ Set both your Domain and API Key first.";
+        } else {
+          await setSetting(env, "shortlink_enabled", "1");
+        }
       }
     }
     await clearState(env, userId);
     await showShortlinkMenu(env, chatId, messageId, note);
     return;
   }
-
-  if (SUB_MENUS[action]) {
-    await tg(env, "editMessageText", {
-      chat_id: chatId,
-      message_id: messageId,
-      text: SUB_MENUS[action],
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: BACK_BUTTON },
-    });
-  }
 }
 
-// ---------- IMDb, TMDb & Deep MediaInfo (Audio, Subtitles, Quality) ----------
-
-function parseMediaTitle(raw) {
-  const firstLine = (raw || "").split("\n")[0].trim();
-  // Remove leading @channel tags or [brackets] at start
-  const withoutPrefix = firstLine
-    .replace(/^(@\w+\s*[-–|:]?\s*)+/i, "")
-    .replace(/^(\[[^\]]+\]\s*)+/, "")
-    .replace(/\.[a-zA-Z0-9]{2,4}$/, "")
+// ---------- Filename, Quality, Audio & Season/Episode Parser ----------
+function parseMediaFilename(rawName, rawCaption) {
+  const full = `${rawName || ""} ${rawCaption || ""}`;
+  const primary = (rawName || (rawCaption || "").split("\n")[0] || "Untitled")
+    .replace(/\.[^.]+$/, "")
     .replace(/[._]+/g, " ")
     .trim();
 
-  // 1. Detect TV Show pattern (e.g., S01E02 or S01)
-  const tvMatch = withoutPrefix.match(/^(.*?)\bS(\d{1,2})[\s._-]*E?(\d{1,3})?\b/i);
-  if (tvMatch && tvMatch[1].trim().length > 1) {
-    const cleanTv = tvMatch[1].replace(/\b(19\d{2}|20\d{2})\b.*/, "").replace(/[\(\[\-\–:]+$/, "").trim();
-    const yearMatch = tvMatch[1].match(/\b(19\d{2}|20\d{2})\b/);
-    return {
-      query: cleanTv,
-      year: yearMatch ? yearMatch[1] : null,
-      isTv: true,
-      season: parseInt(tvMatch[2], 10),
-      episode: tvMatch[3] ? parseInt(tvMatch[3], 10) : null,
-    };
+  // Detect TV Series Season & Episode: S01E02, S01 E02, S01EP02, Season 1 Episode 2, or standalone S01
+  let isSeries = false;
+  let season = null;
+  let episode = null;
+
+  const seMatch =
+    full.match(/\bS(\d{1,2})[\s._-]*E(?:P)?(\d{1,3})\b/i) ||
+    full.match(/\bSeason[\s._-]*(\d{1,2})[\s._-]*Episode[\s._-]*(\d{1,3})\b/i);
+  const epRangeMatch = full.match(/\bS(\d{1,2})[\s._-]*E(\d{1,3})[\s._-]*[-~][\s._-]*E?(\d{1,3})\b/i);
+  const sOnlyMatch =
+    full.match(/\bS(\d{1,2})\b(?![\s._-]*E\d)/i) ||
+    full.match(/\bSeason[\s._-]*(\d{1,2})\b/i);
+  const epOnlyMatch = full.match(/\b(?:EP|Episode)[\s._-]*(\d{1,3})\b/i);
+
+  if (seMatch) {
+    isSeries = true;
+    season = parseInt(seMatch[1], 10);
+    episode = parseInt(seMatch[2], 10);
+  } else if (epRangeMatch) {
+    isSeries = true;
+    season = parseInt(epRangeMatch[1], 10);
+    episode = parseInt(epRangeMatch[2], 10);
+  } else if (sOnlyMatch) {
+    isSeries = true;
+    season = parseInt(sOnlyMatch[1], 10);
+    if (epOnlyMatch) episode = parseInt(epOnlyMatch[1], 10);
+  } else if (epOnlyMatch) {
+    isSeries = true;
+    season = 1;
+    episode = parseInt(epOnlyMatch[1], 10);
   }
 
-  // 2. Strip quality/codec/language tags before looking for Movie Year (so "2024" beats "2160p")
-  const tagRegex = /\b(2160p|1440p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|camrip|hdcam|predvd|web-?dl|webrip|bluray|brrip|bdrip|hdrip|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|avc|10bit|hdr10?\+?|dv|dolby|aac|ac3|eac3|ddp?5?\.?1|atmos|truehd|dts|dual\s*audio|multi\s*audio|hindi|english|tamil|telugu|malayalam|kannada|esubs?|msubs?)\b.*/i;
-  const beforeTags = withoutPrefix.replace(tagRegex, "").trim();
-
-  const yearMatch = beforeTags.match(/^(.*?)\b(19\d{2}|20[0-3]\d)\b/);
-  if (yearMatch && yearMatch[1].replace(/[\(\[\-\–:]+$/, "").trim().length > 1) {
-    return {
-      query: yearMatch[1].replace(/[\(\[\-\–:]+$/, "").trim(),
-      year: yearMatch[2],
-      isTv: false,
-      season: null,
-      episode: null,
-    };
-  }
-
-  const cleanFallback = beforeTags.replace(/[\(\[\-\–:]+$/, "").trim();
-  return {
-    query: cleanFallback || withoutPrefix.slice(0, 60),
-    year: null,
-    isTv: false,
-    season: null,
-    episode: null,
-  };
-}
-
-// Language dictionary for both filename tags & binary MKV/MP4 track codes
-const LANG_PATTERNS = [
-  { name: "Hindi", re: /\b(hindi|hin)\b/i },
-  { name: "English", re: /\b(english|eng)\b/i },
-  { name: "Tamil", re: /\b(tamil|tam)\b/i },
-  { name: "Telugu", re: /\b(telugu|tel)\b/i },
-  { name: "Malayalam", re: /\b(malayalam|mal)\b/i },
-  { name: "Kannada", re: /\b(kannada|kan)\b/i },
-  { name: "Bengali", re: /\b(bengali|ben)\b/i },
-  { name: "Marathi", re: /\b(marathi|mar)\b/i },
-  { name: "Punjabi", re: /\b(punjabi|pan)\b/i },
-  { name: "Gujarati", re: /\b(gujarati|guj)\b/i },
-  { name: "Japanese", re: /\b(japanese|jpn|jap)\b/i },
-  { name: "Korean", re: /\b(korean|kor)\b/i },
-  { name: "Chinese", re: /\b(chinese|chi|zho)\b/i },
-  { name: "Spanish", re: /\b(spanish|spa)\b/i },
-  { name: "French", re: /\b(french|fre|fra)\b/i },
-  { name: "German", re: /\b(german|ger|deu)\b/i },
-  { name: "Russian", re: /\b(russian|rus)\b/i },
-  { name: "Arabic", re: /\b(arabic|ara)\b/i },
-  { name: "Indonesian", re: /\b(indonesian|ind)\b/i },
-];
-
-// Deep binary inspection for files <= 20MB (Telegram getFile limit)
-async function inspectBinaryHeader(env, fileId, fileSize) {
-  if (!fileSize || fileSize > 20 * 1024 * 1024) return null;
-  try {
-    const gf = await tg(env, "getFile", { file_id: fileId });
-    if (!gf.ok || !gf.result || !gf.result.file_path) return null;
-    const url = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${gf.result.file_path}`;
-    const res = await fetch(url, { headers: { Range: "bytes=0-131071" } });
-    if (!res.ok) return null;
-    const buf = new Uint8Array(await res.arrayBuffer());
-    const text = new TextDecoder("latin1").decode(buf);
-    const langs = [];
-    for (const lp of LANG_PATTERNS) {
-      if (lp.re.test(text) && !langs.includes(lp.name)) langs.push(lp.name);
-    }
-    const hasSub = /S_TEXT\/UTF8|S_TEXT\/ASS|wvtt|tx3g|stpp/i.test(text);
-    return { langs, hasSub };
-  } catch (err) {
-    return null;
-  }
-}
-
-async function extractMediaInfo(env, info, rawCaption) {
-  const f = info.file;
-  const sourceStr = `${info.name || ""}\n${rawCaption || ""}`;
-
-  // 1. Quality / Resolution Label + Sort Order (480p -> 720p -> 1080p -> 2160p)
+  // Extract Resolution / Quality
   let quality = "HD";
-  let qOrder = 5;
-  let exactRes = null;
+  if (/\b(2160p|4k|uhd)\b/i.test(full)) quality = "2160p 4K";
+  else if (/\b1440p\b/i.test(full)) quality = "1440p";
+  else if (/\b1080p\b/i.test(full)) quality = "1080p";
+  else if (/\b720p\b/i.test(full)) quality = "720p";
+  else if (/\b480p\b/i.test(full)) quality = "480p";
+  else if (/\b360p\b/i.test(full)) quality = "360p";
 
-  const qMatch = sourceStr.match(/\b(2160p|4K|UHD|1440p|2K|1080p|FHD|720p|540p|480p|360p|240p|CAMRip|HDCAM|PreDVD|HQ\s*S-?Print)\b/i);
-  if (f.width && f.height) {
-    exactRes = `${f.width}×${f.height}`;
-    const shortSide = Math.min(f.width, f.height);
-    const longSide = Math.max(f.width, f.height);
-    if (longSide >= 3800 || shortSide >= 2100) { quality = "2160p 4K"; qOrder = 4; }
-    else if (longSide >= 2500 || shortSide >= 1400) { quality = "1440p 2K"; qOrder = 3.5; }
-    else if (longSide >= 1900 || shortSide >= 1000) { quality = "1080p"; qOrder = 3; }
-    else if (longSide >= 1200 || shortSide >= 700) { quality = "720p"; qOrder = 2; }
-    else if (longSide >= 800 || shortSide >= 460) { quality = "480p"; qOrder = 1; }
-    else { quality = "360p"; qOrder = 0.5; }
-  }
-  if (qMatch) {
-    const rawQ = qMatch[1].toUpperCase();
-    if (/2160P|4K|UHD/.test(rawQ)) { quality = "2160p 4K"; qOrder = 4; }
-    else if (/1440P|2K/.test(rawQ)) { quality = "1440p 2K"; qOrder = 3.5; }
-    else if (/1080P|FHD/.test(rawQ)) { quality = "1080p"; qOrder = 3; }
-    else if (/720P/.test(rawQ)) { quality = "720p"; qOrder = 2; }
-    else if (/540P/.test(rawQ)) { quality = "540p"; qOrder = 1.5; }
-    else if (/480P/.test(rawQ)) { quality = "480p"; qOrder = 1; }
-    else if (/360P/.test(rawQ)) { quality = "360p"; qOrder = 0.5; }
-    else { quality = rawQ; qOrder = 0.2; }
-  }
+  // Extract Rip / Source Type
+  let source = "";
+  if (/\bblu[\s._-]?ray|bdrip|brrip\b/i.test(full)) source = "BluRay";
+  else if (/\bweb[\s._-]?dl\b/i.test(full)) source = "WEB-DL";
+  else if (/\bweb[\s._-]?rip\b/i.test(full)) source = "WEBRip";
+  else if (/\bhdrip\b/i.test(full)) source = "HDRip";
+  else if (/\bhdcam|camrip\b/i.test(full)) source = "HDCAM";
 
-  // 2. Source & Video Codec
-  const ripMatch = sourceStr.match(/\b(BluRay|BRRip|BDRip|REMUX|WEB-?DL|WEBRip|HDRip|DVDRip|HDTV|CAMRip|HDCAM)\b/i);
-  const vCodecMatch = sourceStr.match(/\b(x264|x265|H\.?264|H\.?265|HEVC|AVC|AV1|VP9|10-?bit)\b/i);
-  const hdrMatch = sourceStr.match(/\b(HDR10\+?|Dolby\s*Vision|DV|HDR)\b/i);
+  // Extract Video & Audio Codecs
+  let vCodec = "";
+  if (/\b(x265|h\.?265|hevc)\b/i.test(full)) vCodec = "HEVC x265";
+  else if (/\b(x264|h\.?264|avc)\b/i.test(full)) vCodec = "x264";
+  else if (/\bav1\b/i.test(full)) vCodec = "AV1";
 
-  const vParts = [];
-  if (ripMatch) vParts.push(ripMatch[1]);
-  if (vCodecMatch) vParts.push(vCodecMatch[1].toUpperCase());
-  if (hdrMatch) vParts.push(hdrMatch[1].toUpperCase());
-  const videoTag = vParts.join(" · ") || null;
+  let aCodec = "";
+  if (/\batmos\b/i.test(full)) aCodec = "Atmos";
+  else if (/\b(ddp|eac3|dd\+|5\.1)\b/i.test(full)) aCodec = "DD+ 5.1";
+  else if (/\baac\b/i.test(full)) aCodec = "AAC";
 
-  // 3. Audio Languages & Audio Codec
-  const detectedLangs = [];
-  for (const lp of LANG_PATTERNS) {
-    if (lp.re.test(sourceStr)) detectedLangs.push(lp.name);
-  }
-
-  // Optional binary header check if file <= 20MB
-  const bin = await inspectBinaryHeader(env, f.file_id, f.file_size);
-  if (bin && bin.langs.length) {
-    for (const l of bin.langs) {
-      if (!detectedLangs.includes(l)) detectedLangs.push(l);
-    }
+  // Extract Audio Languages
+  const langMap = [
+    [/\bhindi\b|\bhin\b/i, "Hindi"],
+    [/\benglish\b|\beng\b/i, "English"],
+    [/\btamil\b|\btam\b/i, "Tamil"],
+    [/\btelugu\b|\btel\b/i, "Telugu"],
+    [/\bmalayalam\b|\bmal\b/i, "Malayalam"],
+    [/\bkannada\b|\bkan\b/i, "Kannada"],
+    [/\bkorean\b|\bkor\b/i, "Korean"],
+    [/\bjapanese\b|\bjap\b|\bjpn\b/i, "Japanese"],
+    [/\bspanish\b|\bspa\b/i, "Spanish"],
+    [/\brussian\b|\brus\b/i, "Russian"],
+    [/\bdual[\s._-]*audio\b/i, "Dual Audio"],
+    [/\bmulti[\s._-]*audio\b/i, "Multi Audio"],
+  ];
+  const audioLangs = [];
+  for (const [rx, label] of langMap) {
+    if (rx.test(full) && !audioLangs.includes(label)) audioLangs.push(label);
   }
 
-  let audioLangStr = detectedLangs.join(", ");
-  if (!audioLangStr) {
-    if (/\bdual\s*audio\b/i.test(sourceStr)) audioLangStr = "Dual Audio (Hindi, English)";
-    else if (/\bmulti\s*audio\b/i.test(sourceStr)) audioLangStr = "Multi Audio";
-  } else if (/\bdual\s*audio\b/i.test(sourceStr) && detectedLangs.length === 1) {
-    audioLangStr += " + Dual Audio";
-  }
+  // Clean Title & Year for TMDb/OMDb lookup and Group Key
+  let year = null;
+  const yearMatch = primary.match(/\b(19\d{2}|20\d{2})\b/);
+  if (yearMatch) year = yearMatch[1];
 
-  const aCodecMatch = sourceStr.match(/\b(AAC|AC3|EAC3|DDP|DD\+|DTS(?:-HD)?|TrueHD|Atmos|FLAC|MP3|Opus)\b/i);
-  const chanMatch = sourceStr.match(/\b(7\.1|5\.1|2\.0)\b/);
-  const aCodecParts = [];
-  if (aCodecMatch) aCodecParts.push(aCodecMatch[1].toUpperCase().replace("DDP", "DD+"));
-  if (chanMatch) aCodecParts.push(`${chanMatch[1]}ch`);
-  const audioCodecStr = aCodecParts.join(" ");
+  let cleanTitle = primary
+    .replace(/^(\[@[^\]]+\]|\[[^\]]+\]|\(@[^)]+\))\s*/g, "")
+    .replace(/\bS\d{1,2}[\s._-]*E(?:P)?\d{1,3}.*$/i, "")
+    .replace(/\bS\d{1,2}\b.*$/i, "")
+    .replace(/\bSeason[\s._-]*\d{1,2}.*$/i, "")
+    .replace(/\b(?:EP|Episode)[\s._-]*\d{1,3}.*$/i, "")
+    .replace(/\b(19\d{2}|20\d{2})\b.*$/, "")
+    .replace(/\b(2160p|1440p|1080p|720p|480p|360p|4k|uhd|web-?dl|web-?rip|bluray|hdrip|x264|x265|hevc|10bit|dual|multi|hindi|english|esub).*$/i, "")
+    .replace(/[()[\]\-_.:]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  const fullAudio = [audioLangStr, audioCodecStr ? `(${audioCodecStr})` : ""].filter(Boolean).join(" ") || null;
+  if (!cleanTitle) cleanTitle = primary.slice(0, 50).trim() || "Untitled";
 
-  // 4. Subtitles
-  let subtitles = null;
-  if (/\b(esubs?|eng\s*subs?|english\s*subs?|subtitles?|soft\s*subs?)\b/i.test(sourceStr)) {
-    subtitles = "English (ESub)";
-  } else if (/\b(msubs?|multi\s*subs?)\b/i.test(sourceStr)) {
-    subtitles = "Multi-Language (MSub)";
-  } else if (/\b(hc-?sub|hardsub|korsub)\b/i.test(sourceStr)) {
-    subtitles = "Hardcoded Subtitles";
-  } else if (bin && bin.hasSub) {
-    subtitles = "Embedded Subtitles";
-  }
-
-  // 5. Duration & Bitrate & Container
-  let duration = null;
-  if (f.duration) {
-    const hrs = Math.floor(f.duration / 3600);
-    const mins = Math.floor((f.duration % 3600) / 60);
-    duration = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
-  }
-
-  let bitrate = null;
-  if (f.file_size && f.duration && f.duration > 0) {
-    const kbps = Math.round((f.file_size * 8) / f.duration / 1000);
-    bitrate = kbps >= 1000 ? `${(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`;
-  }
-
-  const extMatch = (info.name || "").match(/\.([a-zA-Z0-9]{2,4})$/);
-  const container = extMatch ? extMatch[1].toUpperCase() : (f.mime_type ? f.mime_type.split("/")[1].toUpperCase() : "MKV");
-
-  // Extra tag for button disambiguation (e.g. HEVC, 10bit)
-  let shortCodec = "";
-  if (/\b(hevc|x265|10bit)\b/i.test(sourceStr)) shortCodec = "HEVC";
+  const slug = cleanTitle.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  // Crucial for Series Season Batching:
+  // All episodes of the same Series + Season share ONE groupKey so they merge into ONE channel post!
+  const groupKey = isSeries
+    ? `series:${slug}:${year || "na"}:s${String(season || 1).padStart(2, "0")}`
+    : `movie:${slug}:${year || "na"}`;
 
   return {
+    cleanTitle,
+    year,
+    isSeries,
+    season: isSeries ? (season || 1) : null,
+    episode,
     quality,
-    qOrder,
-    exactRes,
-    videoTag,
-    audioLangs: detectedLangs,
-    audioCodecStr,
-    fullAudio,
-    subtitles,
-    duration,
-    bitrate,
-    container,
-    shortCodec,
+    source,
+    vCodec,
+    aCodec,
+    audioLangs,
+    groupKey,
   };
 }
 
-async function fetchMovieMeta(env, rawTitle, parsed) {
+// ---------- Fetch TMDb & OMDb (IMDb) Metadata ----------
+async function fetchMediaMeta(env, info) {
   const metaOn = (await getSetting(env, "meta_enabled")) === "1";
   if (!metaOn) return null;
 
-  const explicitImdb = (rawTitle || "").match(/\b(tt\d{7,9})\b/i);
-  if (!parsed.query && !explicitImdb) return null;
-
   const tmdbKey = await getSetting(env, "tmdb_key");
   const omdbKey = await getSetting(env, "omdb_key");
-
-  let result = {
-    title: null,
-    year: parsed.year,
-    rating: null,
-    genres: null,
-    plot: null,
-    poster: null,
-    imdbId: explicitImdb ? explicitImdb[1] : null,
-    tmdbId: null,
-    mediaType: parsed.isTv ? "tv" : "movie",
-    runtime: null,
-    languages: null,
+  const out = {
+    title: info.cleanTitle,
+    year: info.year || "",
+    rating: "",
+    genres: "",
+    plot: "",
+    poster: "",
+    type: info.isSeries ? "TV Series" : "Movie",
   };
 
-  // 1. TMDb Lookup
+  // 1. Try TMDb first (best posters & series recognition)
   if (tmdbKey) {
     try {
-      let item = null;
-      if (result.imdbId) {
-        const findUrl = `https://api.themoviedb.org/3/find/${result.imdbId}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`;
-        const findRes = await fetch(findUrl).then((r) => r.json());
-        item = (findRes.movie_results && findRes.movie_results[0]) || (findRes.tv_results && findRes.tv_results[0]);
-        if (findRes.tv_results && findRes.tv_results[0]) result.mediaType = "tv";
-      } else {
-        const type = parsed.isTv ? "tv" : "movie";
-        const yearParam = parsed.year ? (parsed.isTv ? `&first_air_date_year=${parsed.year}` : `&year=${parsed.year}`) : "";
-        const searchUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(parsed.query)}${yearParam}`;
-        const sRes = await fetch(searchUrl).then((r) => r.json());
-        item = sRes.results && sRes.results[0];
-        // Retry without year if strict year search returned nothing
-        if (!item && yearParam) {
-          const retryUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(parsed.query)}`;
-          const rRes = await fetch(retryUrl).then((r) => r.json());
-          item = rRes.results && rRes.results[0];
-        }
-      }
-
-      if (item) {
-        result.tmdbId = item.id;
-        result.title = item.title || item.name;
-        const dateStr = item.release_date || item.first_air_date || "";
-        if (dateStr) result.year = dateStr.slice(0, 4);
-        if (item.vote_average) result.rating = `⭐ ${Number(item.vote_average).toFixed(1)}/10 (TMDb)`;
-        if (item.overview) result.plot = item.overview;
-        if (item.poster_path) result.poster = `https://image.tmdb.org/t/p/w780${item.poster_path}`;
-
-        const detUrl = `https://api.themoviedb.org/3/${result.mediaType}/${item.id}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=external_ids`;
-        const det = await fetch(detUrl).then((r) => r.json());
-        if (det.genres && det.genres.length) {
-          result.genres = det.genres.slice(0, 3).map((g) => g.name).join(", ");
-        }
-        if (det.runtime) result.runtime = `${det.runtime} min`;
-        if (det.spoken_languages && det.spoken_languages.length) {
-          result.languages = det.spoken_languages.map((l) => l.english_name || l.name).filter(Boolean).join(", ");
-        }
-        if (det.external_ids && det.external_ids.imdb_id) {
-          result.imdbId = det.external_ids.imdb_id;
+      const endpoint = info.isSeries ? "tv" : "movie";
+      const yParam = info.year
+        ? (info.isSeries ? `&first_air_date_year=${info.year}` : `&year=${info.year}`)
+        : "";
+      const url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(info.cleanTitle)}${yParam}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      const hit = data.results && data.results[0];
+      if (hit) {
+        out.title = hit.title || hit.name || out.title;
+        const dateStr = hit.release_date || hit.first_air_date || "";
+        if (dateStr) out.year = dateStr.slice(0, 4);
+        if (hit.vote_average) out.rating = `${Number(hit.vote_average).toFixed(1)}/10`;
+        if (hit.overview) out.plot = hit.overview.slice(0, 240) + (hit.overview.length > 240 ? "..." : "");
+        if (hit.backdrop_path || hit.poster_path) {
+          out.poster = `https://image.tmdb.org/t/p/w780${hit.poster_path || hit.backdrop_path}`;
         }
       }
     } catch (err) {
@@ -2387,156 +2570,175 @@ async function fetchMovieMeta(env, rawTitle, parsed) {
     }
   }
 
-  // 2. OMDb (IMDb) Lookup
+  // 2. Try OMDb (for official IMDb rating & genre list)
   if (omdbKey) {
     try {
-      let omdbUrl = null;
-      if (result.imdbId) {
-        omdbUrl = `https://www.omdbapi.com/?apikey=${encodeURIComponent(omdbKey)}&i=${encodeURIComponent(result.imdbId)}`;
-      } else {
-        const yParam = parsed.year ? `&y=${encodeURIComponent(parsed.year)}` : "";
-        omdbUrl = `https://www.omdbapi.com/?apikey=${encodeURIComponent(omdbKey)}&t=${encodeURIComponent(parsed.query)}${yParam}`;
-      }
-      const omdb = await fetch(omdbUrl).then((r) => r.json());
-      if (omdb && omdb.Response === "True") {
-        if (!result.title) result.title = omdb.Title;
-        if (!result.year && omdb.Year) result.year = omdb.Year.slice(0, 4);
-        if (omdb.imdbID) result.imdbId = omdb.imdbID;
-        if (omdb.imdbRating && omdb.imdbRating !== "N/A") {
-          result.rating = `⭐ ${omdb.imdbRating}/10 (IMDb)`;
-        }
-        if (!result.genres && omdb.Genre && omdb.Genre !== "N/A") result.genres = omdb.Genre;
-        if (!result.plot && omdb.Plot && omdb.Plot !== "N/A") result.plot = omdb.Plot;
-        if (!result.runtime && omdb.Runtime && omdb.Runtime !== "N/A") result.runtime = omdb.Runtime;
-        if (!result.languages && omdb.Language && omdb.Language !== "N/A") result.languages = omdb.Language;
-        if (!result.poster && omdb.Poster && omdb.Poster.startsWith("http")) result.poster = omdb.Poster;
+      const oType = info.isSeries ? "series" : "movie";
+      const yParam = info.year ? `&y=${info.year}` : "";
+      const url = `https://www.omdbapi.com/?apikey=${encodeURIComponent(omdbKey)}&t=${encodeURIComponent(info.cleanTitle)}&type=${oType}${yParam}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data && data.Response === "True") {
+        out.title = data.Title || out.title;
+        if (data.Year && !out.year) out.year = data.Year.slice(0, 4);
+        if (data.imdbRating && data.imdbRating !== "N/A") out.rating = `${data.imdbRating}/10`;
+        if (data.Genre && data.Genre !== "N/A") out.genres = data.Genre;
+        if (!out.plot && data.Plot && data.Plot !== "N/A") out.plot = data.Plot.slice(0, 240);
+        if (!out.poster && data.Poster && data.Poster.startsWith("http")) out.poster = data.Poster;
       }
     } catch (err) {
       console.log("OMDb lookup error:", err);
     }
   }
 
-  return result.title || result.rating || result.plot ? result : null;
+  return out;
 }
 
-// Builds the rich caption and sorted multi-quality buttons for a Movie / Episode post
-async function buildGroupedMediaMessage(env, meta, parsed, fallbackTitle, items) {
-  const miEnabled = (await getSetting(env, "mediainfo_enabled")) !== "0";
+// ---------- Build Channel Post Caption & Inline Keyboard ----------
+const QUALITY_ORDER = ["360p", "480p", "720p", "1080p", "1440p", "2160p 4K", "HD"];
 
-  // Sort items from lowest quality (480p) to highest (4K), then by file size
-  items.sort((a, b) => (a.qOrder - b.qOrder) || (a.size - b.size));
+function sortQualities(a, b) {
+  const ia = QUALITY_ORDER.indexOf(a);
+  const ib = QUALITY_ORDER.indexOf(b);
+  return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+}
 
-  let epTag = "";
-  if (parsed && parsed.isTv && parsed.season) {
-    epTag = ` — S${String(parsed.season).padStart(2, "0")}${parsed.episode ? "E" + String(parsed.episode).padStart(2, "0") : ""}`;
-  }
+async function buildChannelPostView(env, meta, info, items, showMediaInfo) {
+  const titleText = meta ? meta.title : info.cleanTitle;
+  const yearText = (meta && meta.year) || info.year;
+  const headerTitle = yearText ? `${titleText} (${yearText})` : titleText;
+  const sTag = info.isSeries ? ` — Season ${String(info.season || 1).padStart(2, "0")}` : "";
 
-  const displayTitle = meta && meta.title
-    ? `${meta.title}${meta.year ? ` (${meta.year})` : ""}${epTag}`
-    : `${(parsed && parsed.query) || fallbackTitle.slice(0, 200)}${parsed && parsed.year ? ` (${parsed.year})` : ""}${epTag}`;
-
-  const lines = [`🎬 <b>${esc(displayTitle)}</b>`, ""];
+  const lines = [
+    `🎬 <b>${esc(headerTitle)}${esc(sTag)}</b>`,
+  ];
 
   if (meta) {
-    if (meta.rating) lines.push(`🏆 <b>Rating:</b> ${esc(meta.rating)}`);
+    const badges = [];
+    if (meta.rating) badges.push(`⭐ <b>IMDb:</b> ${esc(meta.rating)}`);
+    if (meta.type) badges.push(`📺 <b>Type:</b> ${esc(meta.type)}`);
+    if (badges.length) lines.push(badges.join("  |  "));
     if (meta.genres) lines.push(`🎭 <b>Genre:</b> ${esc(meta.genres)}`);
   }
 
-  // Combine Audio, Subtitles, Runtime, and Codecs across all uploaded qualities
-  if (miEnabled) {
-    const allAudioLangs = [...new Set(items.flatMap((x) => x.audioLangs || []))];
-    const allAudioCodecs = [...new Set(items.map((x) => x.audioCodecStr).filter(Boolean))];
-    let audioText = allAudioLangs.join(", ");
-    if (!audioText) {
-      const customFull = items.map((x) => x.fullAudio).find(Boolean);
-      if (customFull) audioText = customFull;
-      else if (meta && meta.languages) audioText = meta.languages;
-    } else if (allAudioCodecs.length) {
-      audioText += ` (${allAudioCodecs.join(" / ")})`;
+  // Aggregate Audio Languages & Codecs across uploaded items
+  const allLangs = [];
+  const allQuals = [];
+  const allCodecs = [];
+  for (const it of items) {
+    if (it.quality && !allQuals.includes(it.quality)) allQuals.push(it.quality);
+    for (const l of it.audioLangs || []) {
+      if (!allLangs.includes(l)) allLangs.push(l);
     }
-    if (audioText) lines.push(`🔊 <b>Audio:</b> ${esc(audioText)}`);
+    const cStr = [it.source, it.vCodec, it.aCodec].filter(Boolean).join(" ");
+    if (cStr && !allCodecs.includes(cStr)) allCodecs.push(cStr);
+  }
+  allQuals.sort(sortQualities);
 
-    const allSubs = [...new Set(items.map((x) => x.subtitles).filter(Boolean))];
-    if (allSubs.length) {
-      lines.push(`💬 <b>Subtitles:</b> ${esc(allSubs.join(" / "))}`);
-    }
-
-    const runtimeStr = items.map((x) => x.duration).find(Boolean) || (meta && meta.runtime);
-    if (runtimeStr) lines.push(`⏱ <b>Runtime:</b> ${esc(runtimeStr)}`);
-
-    const quals = [...new Set(items.map((x) => x.quality))];
-    const vTags = [...new Set(items.map((x) => x.videoTag).filter(Boolean))];
-    const containers = [...new Set(items.map((x) => x.container).filter(Boolean))];
-    const techParts = [
-      quals.join(" | "),
-      vTags.join(" / "),
-      containers.join("/"),
-    ].filter(Boolean);
-    if (techParts.length) {
-      lines.push(`📊 <b>MediaInfo:</b> <code>${esc(techParts.join(" • "))}</code>`);
-    }
-  } else if (meta && meta.runtime) {
-    lines.push(`⏱ <b>Runtime:</b> ${esc(meta.runtime)}`);
+  if (showMediaInfo) {
+    if (allLangs.length) lines.push(`🔊 <b>Audio:</b> ${esc(allLangs.join(", "))}`);
+    if (allQuals.length) lines.push(`💿 <b>Available Qualities:</b> ${esc(allQuals.join(" | "))}`);
+    if (allCodecs.length) lines.push(`⚙️ <b>Format:</b> ${esc(allCodecs[0])}`);
   }
 
   if (meta && meta.plot) {
-    const shortPlot = meta.plot.length > 240 ? meta.plot.slice(0, 237) + "..." : meta.plot;
-    lines.push(`\n📝 <b>Storyline:</b> <i>${esc(shortPlot)}</i>`);
+    lines.push(`\n📝 <i>${esc(meta.plot)}</i>`);
   }
 
-  lines.push(`\n⬇️ <b>Select your preferred quality below:</b>`);
+  lines.push("");
+  const buttons = [];
 
-  // Build quality buttons (pair 2 buttons per row when there are multiple files)
-  const qButtons = [];
-  for (const item of items) {
-    const link = await makeDeepLink(env, `f${item.rowId}`);
-    const codecBadge = item.shortCodec ? ` ${item.shortCodec}` : "";
-    const label = `📥 ${item.quality}${codecBadge} [${formatSize(item.size)}]`;
-    qButtons.push({ text: label, url: link });
-  }
+  if (info.isSeries) {
+    // TV Series Season Batching:
+    // Group episodes by quality -> 1 button per quality (e.g., "🗂 S01 • 720p (8 EP)")
+    const sNum = String(info.season || 1).padStart(2, "0");
+    lines.push(`📦 <b>Select Quality below to get Season ${sNum} Episodes:</b>`);
 
-  const keyboard = [];
-  if (qButtons.length === 1) {
-    keyboard.push([qButtons[0]]);
-  } else {
-    for (let i = 0; i < qButtons.length; i += 2) {
-      keyboard.push(qButtons.slice(i, i + 2));
+    const byQuality = {};
+    for (const it of items) {
+      const q = it.quality || "HD";
+      if (!byQuality[q]) byQuality[q] = [];
+      byQuality[q].push(it);
     }
+
+    const sortedQuals = Object.keys(byQuality).sort(sortQualities);
+    const rowBuf = [];
+    for (const q of sortedQuals) {
+      const qItems = byQuality[q];
+      const batchId = qItems[0].batchId;
+      const epCount = qItems.length;
+      const link = await makeDeepLink(env, `b${batchId}`);
+      rowBuf.push({
+        text: `🗂 S${sNum} • ${q} (${epCount} EP)`,
+        url: link,
+      });
+      if (rowBuf.length === 2) {
+        buttons.push(rowBuf.splice(0, 2));
+      }
+    }
+    if (rowBuf.length) buttons.push(rowBuf);
+  } else {
+    // Movie Multi-Quality Grouping:
+    // Show each quality button with its exact file size
+    lines.push(`⬇️ <b>Select Quality below to Download:</b>`);
+    items.sort((a, b) => sortQualities(a.quality, b.quality));
+    const rowBuf = [];
+    for (const it of items) {
+      const link = await makeDeepLink(env, `f${it.rowId}`);
+      rowBuf.push({
+        text: `⬇️ ${it.quality} [${formatSize(it.size)}]`,
+        url: link,
+      });
+      if (rowBuf.length === 2) {
+        buttons.push(rowBuf.splice(0, 2));
+      }
+    }
+    if (rowBuf.length) buttons.push(rowBuf);
   }
 
-  const extLinks = [];
-  if (meta && meta.imdbId) {
-    extLinks.push({ text: "⭐ IMDb", url: `https://www.imdb.com/title/${meta.imdbId}/` });
-  }
-  if (meta && meta.tmdbId) {
-    extLinks.push({ text: "🎬 TMDb", url: `https://www.themoviedb.org/${meta.mediaType}/${meta.tmdbId}` });
-  }
-  if (extLinks.length) keyboard.push(extLinks);
-
-  return {
-    postText: lines.join("\n"),
-    markup: { inline_keyboard: keyboard },
-  };
+  return { caption: lines.join("\n"), buttons };
 }
 
-// ---------- Handling new posts in channels ----------
-async function handleChannelPost(post, env) {
+// ---------- Upsert Season Batch in D1 ----------
+async function upsertSeasonBatch(env, groupKey, quality, title, epEntry) {
   await ensureExtraTables(env);
+  const existing = await env.DB.prepare(
+    "SELECT batch_id, items_json FROM batches WHERE group_key = ? AND quality = ?"
+  ).bind(groupKey, quality).first();
 
-  const chatId = String(post.chat.id);
-  const isSource = await env.DB.prepare(
-    "SELECT 1 AS ok FROM channels WHERE role = 'source' AND chat_id = ?"
-  ).bind(chatId).first();
-  if (!isSource) return;
+  if (!existing) {
+    const items = [epEntry];
+    const ins = await env.DB.prepare(
+      "INSERT INTO batches (group_key, quality, title, items_json, updated) VALUES (?, ?, ?, ?, ?)"
+    ).bind(groupKey, quality, title, JSON.stringify(items), Date.now()).run();
+    return ins.meta.last_row_id;
+  }
 
-  if (post.chat.type !== "channel" && !(await isTrustedSender(env, post))) return;
+  let items = [];
+  try { items = JSON.parse(existing.items_json || "[]"); } catch (e) { items = []; }
+
+  // Replace if same episode number or same rowId already exists, otherwise append
+  const idx = items.findIndex((x) =>
+    x.rowId === epEntry.rowId || (epEntry.episode && x.season === epEntry.season && x.episode === epEntry.episode)
+  );
+  if (idx >= 0) items[idx] = epEntry;
+  else items.push(epEntry);
+
+  await env.DB.prepare(
+    "UPDATE batches SET title = ?, items_json = ?, updated = ? WHERE batch_id = ?"
+  ).bind(title, JSON.stringify(items), Date.now(), existing.batch_id).run();
+
+  return existing.batch_id;
+}
+
+// ---------- Handling Source Channel Uploads ----------
+async function handleChannelPost(post, env) {
+  const sources = await getChannels(env, "source");
+  if (!sources.some((s) => String(s.chat_id) === String(post.chat.id))) return;
+  if (!(await isTrustedSender(env, post))) return;
 
   const info = classifyPost(post);
   if (!info) return;
-
-  const destRole = info.kind === "pdf" ? "pdfs" : "lectures";
-  const dest = await getChannels(env, destRole);
-  if (!dest.length) return;
 
   const title = makeTitle(post, info.name);
   const rowId = await saveFile(env, {
@@ -2549,225 +2751,236 @@ async function handleChannelPost(post, env) {
   });
   if (!rowId) return;
 
-  // --- PDF Posting (Single Post) ---
+  // 1. Handle PDF posts
   if (info.kind === "pdf") {
+    const targets = await getChannels(env, "pdfs");
+    if (!targets.length) return;
+    const targetChat = targets[0].chat_id;
+    const cover = await getSetting(env, "cover_pdf");
     const link = await makeDeepLink(env, `f${rowId}`);
-    const postText = `📄 <b>${esc(title.slice(0, 300))}</b>\n\n🏷 <b>Type:</b> PDF Document\n📦 <b>Size:</b> ${formatSize(info.file.file_size)}`;
-    const markup = { inline_keyboard: [[{ text: `📥 Get PDF [${formatSize(info.file.file_size)}]`, url: link }]] };
-    const thumb = info.file.thumbnail || info.file.thumb;
-    const cover = (await getSetting(env, "cover_pdf")) || (thumb ? thumb.file_id : null);
+    const caption = `📄 <b>${esc(title)}</b>\n📦 <b>Size:</b> ${formatSize(info.file.file_size)}`;
+    const markup = { inline_keyboard: [[{ text: "📥 Download PDF", url: link }]] };
+
     if (cover) {
-      const sent = await tg(env, "sendPhoto", { chat_id: dest[0].chat_id, photo: cover, caption: postText, parse_mode: "HTML", reply_markup: markup });
-      if (sent.ok) return;
+      await tg(env, "sendPhoto", {
+        chat_id: targetChat, photo: cover, caption, parse_mode: "HTML", reply_markup: markup,
+      });
+    } else {
+      await tg(env, "sendMessage", {
+        chat_id: targetChat, text: caption, parse_mode: "HTML", reply_markup: markup,
+      });
     }
-    await tg(env, "sendMessage", { chat_id: dest[0].chat_id, text: postText, parse_mode: "HTML", reply_markup: markup });
     return;
   }
 
-  // --- Video / Movie Posting (Multi-Quality Grouping + IMDb/TMDb + Deep MediaInfo) ---
-  const rawSearchText = `${post.caption || ""}\n${info.name}`;
-  const parsed = parseMediaTitle(rawSearchText);
-  const mi = await extractMediaInfo(env, info, post.caption);
-  const meta = await fetchMovieMeta(env, rawSearchText, parsed);
+  // 2. Handle Movies & TV Series Episodes
+  const targets = await getChannels(env, "lectures");
+  if (!targets.length) return;
+  const targetChat = targets[0].chat_id;
 
-  // Build unique group key so 480p, 720p, 1080p, 2160p of the same Movie (or TV Episode) merge into 1 post
-  const epSuffix = parsed.isTv && parsed.season ? `_s${parsed.season}e${parsed.episode || 0}` : "";
-  let baseKey = "";
-  if (meta && meta.imdbId) {
-    baseKey = `imdb_${meta.imdbId}`;
-  } else if (meta && meta.tmdbId) {
-    baseKey = `tmdb_${meta.mediaType}_${meta.tmdbId}`;
+  await ensureExtraTables(env);
+  const parsed = parseMediaFilename(info.name, post.caption || "");
+  const groupOn = (await getSetting(env, "group_qualities")) !== "0";
+  const showMediaInfo = (await getSetting(env, "mediainfo_enabled")) !== "0";
+
+  // Check if we already have an existing channel post for this Movie or Series Season
+  const existingPost = groupOn
+    ? await env.DB.prepare("SELECT * FROM media_posts WHERE group_key = ?").bind(parsed.groupKey).first()
+    : null;
+
+  let meta = null;
+  let items = [];
+
+  if (existingPost) {
+    try { meta = JSON.parse(existingPost.meta_json || "null"); } catch (e) { meta = null; }
+    try { items = JSON.parse(existingPost.items_json || "[]"); } catch (e) { items = []; }
   } else {
-    const slug = (parsed.query || title).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 50);
-    baseKey = `raw_${slug}_${parsed.year || "na"}`;
+    meta = await fetchMediaMeta(env, parsed);
   }
-  const groupKey = `${dest[0].chat_id}:${baseKey}${epSuffix}`;
+
+  const displayTitle = (meta && meta.title)
+    ? (parsed.isSeries ? `${meta.title} S${String(parsed.season || 1).padStart(2, "0")}` : meta.title)
+    : (parsed.isSeries ? `${parsed.cleanTitle} S${String(parsed.season || 1).padStart(2, "0")}` : parsed.cleanTitle);
+
+  let batchId = null;
+  if (parsed.isSeries) {
+    batchId = await upsertSeasonBatch(env, parsed.groupKey, parsed.quality, displayTitle, {
+      rowId,
+      season: parsed.season || 1,
+      episode: parsed.episode || (items.filter((x) => x.quality === parsed.quality).length + 1),
+      size: info.file.file_size || 0,
+      audioLangs: parsed.audioLangs,
+    });
+  }
 
   const newItem = {
     rowId,
-    quality: mi.quality,
-    qOrder: mi.qOrder,
+    batchId,
+    quality: parsed.quality,
+    season: parsed.season,
+    episode: parsed.episode,
     size: info.file.file_size || 0,
-    shortCodec: mi.shortCodec,
-    videoTag: mi.videoTag,
-    audioLangs: mi.audioLangs,
-    audioCodecStr: mi.audioCodecStr,
-    fullAudio: mi.fullAudio,
-    subtitles: mi.subtitles,
-    duration: mi.duration,
-    container: mi.container,
+    source: parsed.source,
+    vCodec: parsed.vCodec,
+    aCodec: parsed.aCodec,
+    audioLangs: parsed.audioLangs,
   };
 
-  const groupEnabled = (await getSetting(env, "group_qualities")) !== "0";
-  const existing = groupEnabled
-    ? await env.DB.prepare("SELECT * FROM media_posts WHERE group_key = ?").bind(groupKey).first()
-    : null;
-
-  // If a post for this movie already exists in the channel, add the new quality button & update MediaInfo!
-  if (existing && String(existing.chat_id) === String(dest[0].chat_id)) {
-    let items = [];
-    try { items = JSON.parse(existing.items_json || "[]"); } catch (e) { items = []; }
-
-    const idx = items.findIndex((x) => x.rowId === rowId || (x.quality === newItem.quality && x.shortCodec === newItem.shortCodec && Math.abs(x.size - newItem.size) < 5 * 1024 * 1024));
+  if (parsed.isSeries) {
+    // Replace if same quality + same episode, otherwise add
+    const idx = items.findIndex((x) =>
+      x.rowId === rowId || (parsed.episode && x.quality === parsed.quality && x.episode === parsed.episode)
+    );
     if (idx >= 0) items[idx] = newItem;
     else items.push(newItem);
+  } else {
+    // Movie: replace if same quality already uploaded, otherwise add new quality button
+    const idx = items.findIndex((x) => x.quality === parsed.quality);
+    if (idx >= 0) items[idx] = newItem;
+    else items.push(newItem);
+  }
 
-    let savedMeta = meta;
-    if (!savedMeta && existing.meta_json) {
-      try { savedMeta = JSON.parse(existing.meta_json); } catch (e) {}
-    }
+  const view = await buildChannelPostView(env, meta, parsed, items, showMediaInfo);
 
-    const built = await buildGroupedMediaMessage(env, savedMeta, parsed, title, items);
-    const editMethod = existing.has_photo ? "editMessageCaption" : "editMessageText";
+  // If the channel post already exists, edit its caption & buttons in place!
+  if (existingPost && existingPost.message_id && String(existingPost.chat_id) === String(targetChat)) {
+    const editMethod = existingPost.has_photo ? "editMessageCaption" : "editMessageText";
     const editPayload = {
-      chat_id: existing.chat_id,
-      message_id: existing.message_id,
+      chat_id: targetChat,
+      message_id: existingPost.message_id,
       parse_mode: "HTML",
-      reply_markup: built.markup,
-      [existing.has_photo ? "caption" : "text"]: built.postText,
+      reply_markup: { inline_keyboard: view.buttons },
     };
+    if (existingPost.has_photo) editPayload.caption = view.caption;
+    else editPayload.text = view.caption;
 
     const edited = await tg(env, editMethod, editPayload);
-    if (edited.ok || (edited.description && /message is not modified/i.test(edited.description))) {
+    if (edited.ok || /message is not modified/i.test(edited.description || "")) {
       await env.DB.prepare(
-        "UPDATE media_posts SET items_json = ?, meta_json = ?, updated = ? WHERE group_key = ?"
-      ).bind(JSON.stringify(items), savedMeta ? JSON.stringify(savedMeta) : existing.meta_json, Date.now(), groupKey).run();
+        "UPDATE media_posts SET items_json = ?, updated = ? WHERE group_key = ?"
+      ).bind(JSON.stringify(items), Date.now(), parsed.groupKey).run();
       return;
     }
-    // If the old channel post was manually deleted from the channel, fall through and create a fresh post containing all qualities!
-    console.log("Could not edit existing post, creating a fresh combined post:", edited.description);
   }
 
-  // Create a brand new post (or replacement post if the old one was deleted)
-  const items = [newItem];
-  const built = await buildGroupedMediaMessage(env, meta, parsed, title, items);
-
-  const thumb = info.file.thumbnail || info.file.thumb;
-  const savedCover = await getSetting(env, "cover_lecture");
-  // Priority: Official TMDb/IMDb Poster -> Custom Fallback Cover -> Video Thumbnail
-  const cover = (meta && meta.poster) || savedCover || (thumb ? thumb.file_id : null);
-
-  let postedMsg = null;
+  // Otherwise publish a brand-new post to the Movies/Series Channel
+  const fallbackCover = await getSetting(env, "cover_lecture");
+  const photoSource = (meta && meta.poster) || fallbackCover || null;
+  let sent = null;
   let hasPhoto = 0;
 
-  if (cover) {
-    const sent = await tg(env, "sendPhoto", {
-      chat_id: dest[0].chat_id,
-      photo: cover,
-      caption: built.postText,
+  if (photoSource) {
+    sent = await tg(env, "sendPhoto", {
+      chat_id: targetChat,
+      photo: photoSource,
+      caption: view.caption,
       parse_mode: "HTML",
-      reply_markup: built.markup,
+      reply_markup: { inline_keyboard: view.buttons },
     });
-    if (sent.ok) {
-      postedMsg = sent.result;
-      hasPhoto = 1;
-    } else {
-      console.log("Cover failed, posting without it:", JSON.stringify(sent));
-    }
+    if (sent.ok) hasPhoto = 1;
   }
 
-  if (!postedMsg) {
-    const posted = await tg(env, "sendMessage", {
-      chat_id: dest[0].chat_id,
-      text: built.postText,
+  if (!sent || !sent.ok) {
+    sent = await tg(env, "sendMessage", {
+      chat_id: targetChat,
+      text: view.caption,
       parse_mode: "HTML",
-      reply_markup: built.markup,
+      reply_markup: { inline_keyboard: view.buttons },
     });
-    if (posted.ok) {
-      postedMsg = posted.result;
-    } else {
-      await env.DB.prepare("DELETE FROM files WHERE id = ?").bind(rowId).run();
-      await alertOwner(env, `post${dest[0].chat_id}`,
-        `I couldn't post "${title}" to "${dest[0].title}": ${posted.description}. Check that I'm an admin there with the Post Messages permission.`);
-      return;
-    }
   }
 
-  if (groupEnabled && postedMsg) {
+  if (sent && sent.ok && groupOn) {
     await env.DB.prepare(
-      "INSERT OR REPLACE INTO media_posts (group_key, chat_id, message_id, has_photo, meta_json, items_json, updated) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO media_posts (group_key, chat_id, message_id, has_photo, meta_json, items_json, updated) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?)"
     ).bind(
-      groupKey,
-      String(dest[0].chat_id),
-      postedMsg.message_id,
+      parsed.groupKey,
+      String(targetChat),
+      sent.result.message_id,
       hasPhoto,
-      meta ? JSON.stringify(meta) : null,
+      JSON.stringify(meta),
       JSON.stringify(items),
       Date.now()
     ).run();
   }
 }
 
-// ---------- Entry point ----------
+// ---------- Constant-time string compare for webhook & HMAC ----------
 function safeEqual(a, b) {
-  if (!a || !b || a.length !== b.length) return false;
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
   return diff === 0;
 }
 
+// ---------- Cloudflare Worker Entrypoint ----------
 export default {
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(runCron(env));
-  },
-
   async fetch(request, env) {
     const url = new URL(request.url);
     APP_ORIGIN = url.origin;
 
-    // Anti-Copyright Redirect Shield: /get/f123 -> bounces user to current active Telegram bot
-    if (request.method === "GET" && url.pathname.startsWith("/get/")) {
-      const token = url.pathname.slice(5).replace(/[^A-Za-z0-9_-]/g, "");
-      const username = await getBotUsername(env);
-      if (username && token) {
-        return Response.redirect(`https://t.me/${username}?start=${token}`, 302);
-      }
-      return new Response("Bot link not ready yet.", { status: 404 });
+    // 1. Anti-Bypass Verification Mini App Page
+    if (request.method === "GET" && url.pathname === "/verify") {
+      return new Response(VERIFY_HTML, {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
     }
 
+    // 2. Skip-Ads / Premium Mini App Page
     if (request.method === "GET" && url.pathname === "/app") {
       return new Response(APP_HTML, {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
         },
       });
     }
+
+    // 3. Worker Redirect Shield for Channel Buttons (/get/f12 or /get/b5)
+    if (request.method === "GET" && url.pathname.startsWith("/get/")) {
+      const startParam = url.pathname.slice(5).replace(/[^A-Za-z0-9_-]/g, "");
+      const username = await getBotUsername(env);
+      if (!username || !startParam) return new Response("Not found", { status: 404 });
+      return Response.redirect(`https://t.me/${username}?start=${startParam}`, 302);
+    }
+
+    // 4. Mini App JSON APIs (/api/verify-link, /api/me, /api/pay, /api/stars, /api/utr)
     if (url.pathname.startsWith("/api/")) {
-      try {
-        return await handleApi(request, env, url.pathname);
-      } catch (err) {
-        console.log("API error:", String(err).split(env.BOT_TOKEN).join("***"));
-        return json({ error: "Server problem. Please try again." }, 500);
+      return handleApi(request, env, url.pathname);
+    }
+
+    // 5. Telegram Webhook Endpoint
+    if (request.method === "POST") {
+      const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+      if (env.WEBHOOK_SECRET && !safeEqual(secret, env.WEBHOOK_SECRET)) {
+        return new Response("Forbidden", { status: 403 });
       }
+      try {
+        const update = await request.json();
+        if (update.pre_checkout_query) {
+          await handlePreCheckout(update.pre_checkout_query, env);
+        } else if (update.message) {
+          await handleMessage(update.message, env);
+        } else if (update.channel_post) {
+          await handleChannelPost(update.channel_post, env);
+        } else if (update.callback_query) {
+          await handleButton(update.callback_query, env);
+        }
+      } catch (err) {
+        console.log("Webhook error:", String(err).split(env.BOT_TOKEN).join("***"));
+      }
+      return new Response("OK");
     }
 
-    if (request.method !== "POST") {
-      return new Response("Autoposter bot is running ✅");
-    }
-    const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-    if (!safeEqual(secret, env.WEBHOOK_SECRET)) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    let update;
-    try {
-      update = await request.json();
-    } catch (err) {
-      return new Response("Bad request", { status: 400 });
-    }
-
-    try {
-      if (update.message) await handleMessage(update.message, env);
-      if (update.callback_query) await handleButton(update.callback_query, env);
-      if (update.channel_post) await handleChannelPost(update.channel_post, env);
-      if (update.pre_checkout_query) await handlePreCheckout(update.pre_checkout_query, env);
-    } catch (err) {
-      const detail = String(err && err.stack ? err.stack : err).split(env.BOT_TOKEN).join("***");
-      console.log("Error:", detail);
-      await alertOwner(env, "error", `Something went wrong in the bot: ${detail.slice(0, 300)}`);
-    }
     return new Response("OK");
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runCron(env));
   },
 };
