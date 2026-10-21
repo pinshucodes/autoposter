@@ -2473,12 +2473,12 @@ async function handleButton(query, env) {
 // ---------- Filename, Quality, Audio & Season/Episode Parser ----------
 function parseMediaFilename(rawName, rawCaption) {
   const full = `${rawName || ""} ${rawCaption || ""}`;
-  const primary = (rawName || (rawCaption || "").split("\n")[0] || "Untitled")
+  const rawFirstLine = (rawName || (rawCaption || "").split("\n")[0] || "Untitled")
     .replace(/\.[^.]+$/, "")
     .replace(/[._]+/g, " ")
+    .replace(/^(\[@[^\]]+\]|\[[^\]]+\]|\(@[^)]+\))\s*/g, "")
     .trim();
 
-  // Detect TV Series Season & Episode: S01E02, S01 E02, S01EP02, Season 1 Episode 2, or standalone S01
   let isSeries = false;
   let season = null;
   let episode = null;
@@ -2510,7 +2510,6 @@ function parseMediaFilename(rawName, rawCaption) {
     episode = parseInt(epOnlyMatch[1], 10);
   }
 
-  // Extract Resolution / Quality
   let quality = "HD";
   if (/\b(2160p|4k|uhd)\b/i.test(full)) quality = "2160p 4K";
   else if (/\b1440p\b/i.test(full)) quality = "1440p";
@@ -2519,7 +2518,6 @@ function parseMediaFilename(rawName, rawCaption) {
   else if (/\b480p\b/i.test(full)) quality = "480p";
   else if (/\b360p\b/i.test(full)) quality = "360p";
 
-  // Extract Rip / Source Type
   let source = "";
   if (/\bblu[\s._-]?ray|bdrip|brrip\b/i.test(full)) source = "BluRay";
   else if (/\bweb[\s._-]?dl\b/i.test(full)) source = "WEB-DL";
@@ -2527,7 +2525,6 @@ function parseMediaFilename(rawName, rawCaption) {
   else if (/\bhdrip\b/i.test(full)) source = "HDRip";
   else if (/\bhdcam|camrip\b/i.test(full)) source = "HDCAM";
 
-  // Extract Video & Audio Codecs
   let vCodec = "";
   if (/\b(x265|h\.?265|hevc)\b/i.test(full)) vCodec = "HEVC x265";
   else if (/\b(x264|h\.?264|avc)\b/i.test(full)) vCodec = "x264";
@@ -2538,7 +2535,6 @@ function parseMediaFilename(rawName, rawCaption) {
   else if (/\b(ddp|eac3|dd\+|5\.1)\b/i.test(full)) aCodec = "DD+ 5.1";
   else if (/\baac\b/i.test(full)) aCodec = "AAC";
 
-  // Extract Audio Languages
   const langMap = [
     [/\bhindi\b|\bhin\b/i, "Hindi"],
     [/\benglish\b|\beng\b/i, "English"],
@@ -2546,6 +2542,9 @@ function parseMediaFilename(rawName, rawCaption) {
     [/\btelugu\b|\btel\b/i, "Telugu"],
     [/\bmalayalam\b|\bmal\b/i, "Malayalam"],
     [/\bkannada\b|\bkan\b/i, "Kannada"],
+    [/\bbengali\b|\bben\b/i, "Bengali"],
+    [/\bmarathi\b|\bmar\b/i, "Marathi"],
+    [/\bpunjabi\b|\bpun\b/i, "Punjabi"],
     [/\bkorean\b|\bkor\b/i, "Korean"],
     [/\bjapanese\b|\bjap\b|\bjpn\b/i, "Japanese"],
     [/\bspanish\b|\bspa\b/i, "Spanish"],
@@ -2558,34 +2557,32 @@ function parseMediaFilename(rawName, rawCaption) {
     if (rx.test(full) && !audioLangs.includes(label)) audioLangs.push(label);
   }
 
-  // Clean Title & Year for TMDb/OMDb lookup and Group Key
   let year = null;
-  const yearMatch = primary.match(/\b(19\d{2}|20\d{2})\b/);
+  const yearMatch = rawFirstLine.match(/\b(19\d{2}|20\d{2})\b/);
   if (yearMatch) year = yearMatch[1];
 
-  let cleanTitle = primary
-    .replace(/^(\[@[^\]]+\]|\[[^\]]+\]|\(@[^)]+\))\s*/g, "")
+  // Strip "Sample", languages, qualities, and tags so Sample & all Languages share the EXACT same groupKey!
+  let cleanTitle = rawFirstLine
     .replace(/\bS\d{1,2}[\s._-]*E(?:P)?\d{1,3}.*$/i, "")
     .replace(/\bS\d{1,2}\b.*$/i, "")
     .replace(/\bSeason[\s._-]*\d{1,2}.*$/i, "")
     .replace(/\b(?:EP|Episode)[\s._-]*\d{1,3}.*$/i, "")
     .replace(/\b(19\d{2}|20\d{2})\b.*$/, "")
-    .replace(/\b(2160p|1440p|1080p|720p|480p|360p|4k|uhd|web-?dl|web-?rip|bluray|hdrip|x264|x265|hevc|10bit|dual|multi|hindi|english|esub).*$/i, "")
+    .replace(/\b(sample|trailer|teaser|promo|hq|proper|repack|2160p|1440p|1080p|720p|480p|360p|4k|uhd|web-?dl|web-?rip|bluray|bdrip|brrip|hdrip|hdcam|camrip|x264|x265|h264|h265|hevc|avc|10bit|dual|multi|hindi|english|tamil|telugu|malayalam|kannada|bengali|marathi|punjabi|korean|japanese|spanish|russian|hin|eng|tam|tel|mal|kan|esub|esubs|aac|ddp|eac3|atmos).*$/i, "")
     .replace(/[()[\]\-_.:]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
-  if (!cleanTitle) cleanTitle = primary.slice(0, 50).trim() || "Untitled";
+  if (!cleanTitle) cleanTitle = rawFirstLine.slice(0, 40).trim() || "Untitled";
 
   const slug = cleanTitle.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
-  // Crucial for Series Season Batching:
-  // All episodes of the same Series + Season share ONE groupKey so they merge into ONE channel post!
   const groupKey = isSeries
     ? `series:${slug}:${year || "na"}:s${String(season || 1).padStart(2, "0")}`
     : `movie:${slug}:${year || "na"}`;
 
   return {
     cleanTitle,
+    displayFileName: rawFirstLine,
     year,
     isSeries,
     season: isSeries ? (season || 1) : null,
@@ -2616,7 +2613,6 @@ async function fetchMediaMeta(env, info) {
     type: info.isSeries ? "TV Series" : "Movie",
   };
 
-  // 1. Try TMDb first (best posters & series recognition)
   if (tmdbKey) {
     try {
       const endpoint = info.isSeries ? "tv" : "movie";
@@ -2642,7 +2638,6 @@ async function fetchMediaMeta(env, info) {
     }
   }
 
-  // 2. Try OMDb (for official IMDb rating & genre list)
   if (omdbKey) {
     try {
       const oType = info.isSeries ? "series" : "movie";
@@ -2675,8 +2670,8 @@ function sortQualities(a, b) {
   return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
 }
 
-async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampleRowId) {
-  const titleText = meta ? meta.title : info.cleanTitle;
+async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampleRowId, batchId) {
+  const titleText = (meta && meta.title) ? meta.title : info.cleanTitle;
   const yearText = (meta && meta.year) || info.year;
   const headerTitle = yearText ? `${titleText} (${yearText})` : titleText;
   const sTag = info.isSeries ? ` — Season ${String(info.season || 1).padStart(2, "0")}` : "";
@@ -2708,8 +2703,9 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
 
   if (showMediaInfo) {
     if (allLangs.length) lines.push(`🔊 <b>Audio:</b> ${esc(allLangs.join(", "))}`);
-    if (allQuals.length) lines.push(`💿 <b>Available Qualities:</b> ${esc(allQuals.join(" | "))}`);
+    if (allQuals.length) lines.push(`💿 <b>Qualities:</b> ${esc(allQuals.join(" | "))}`);
     if (allCodecs.length) lines.push(`⚙️ <b>Format:</b> ${esc(allCodecs[0])}`);
+    if (items.length) lines.push(`📂 <b>Total Files:</b> ${items.length}`);
   }
 
   if (meta && meta.plot) {
@@ -2717,63 +2713,25 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
   }
 
   lines.push("");
+  lines.push(`⬇️ <b>Tap below to view all files & download:</b>`);
+
   const buttons = [];
 
   if (sampleRowId) {
     const sampleLink = await makeDeepLink(env, `f${sampleRowId}`);
-    buttons.push([{ text: "🎬 Watch 1-Min Sample Video", url: sampleLink }]);
+    buttons.push([{ text: "🎬 Watch Sample Video", url: sampleLink }]);
   }
 
-  if (info.isSeries) {
-    const sNum = String(info.season || 1).padStart(2, "0");
-    lines.push(`📦 <b>Select Quality below to get Season ${sNum} Episodes:</b>`);
-
-    const byQuality = {};
-    for (const it of items) {
-      const q = it.quality || "HD";
-      if (!byQuality[q]) byQuality[q] = [];
-      byQuality[q].push(it);
-    }
-
-    const sortedQuals = Object.keys(byQuality).sort(sortQualities);
-    const rowBuf = [];
-    for (const q of sortedQuals) {
-      const qItems = byQuality[q];
-      const batchId = qItems[0].batchId;
-      const epCount = qItems.length;
-      const link = await makeDeepLink(env, `b${batchId}`);
-      rowBuf.push({
-        text: `🗂 S${sNum} • ${q} (${epCount} EP)`,
-        url: link,
-      });
-      if (rowBuf.length === 2) {
-        buttons.push(rowBuf.splice(0, 2));
-      }
-    }
-    if (rowBuf.length) buttons.push(rowBuf);
-  } else {
-    lines.push(`⬇️ <b>Select Quality below to Download:</b>`);
-    items.sort((a, b) => sortQualities(a.quality, b.quality));
-    const rowBuf = [];
-    for (const it of items) {
-      const link = await makeDeepLink(env, `f${it.rowId}`);
-      const codecLabel = [it.source, it.vCodec].filter(Boolean).join(" ");
-      const btnText = codecLabel ? `⬇️ ${it.quality} (${codecLabel}) [${formatSize(it.size)}]` : `⬇️ ${it.quality} [${formatSize(it.size)}]`;
-      rowBuf.push({
-        text: btnText.slice(0, 60),
-        url: link,
-      });
-      if (rowBuf.length === 2) {
-        buttons.push(rowBuf.splice(0, 2));
-      }
-    }
-    if (rowBuf.length) buttons.push(rowBuf);
+  if (batchId) {
+    const dlLink = await makeDeepLink(env, `b${batchId}`);
+    const countLabel = items.length > 1 ? ` (${items.length} Files)` : "";
+    buttons.push([{ text: `📥 Download Now${countLabel}`, url: dlLink }]);
   }
 
   return { caption: lines.join("\n"), buttons };
 }
 
-// ---------- Upsert Season Batch in D1 ----------
+// ---------- Upsert Master Batch in D1 (Used for both Movies & Series) ----------
 async function upsertSeasonBatch(env, groupKey, quality, title, epEntry) {
   await ensureExtraTables(env);
   const existing = await env.DB.prepare(
@@ -2781,19 +2739,19 @@ async function upsertSeasonBatch(env, groupKey, quality, title, epEntry) {
   ).bind(groupKey, quality).first();
 
   if (!existing) {
-    const items = [epEntry];
+    const items = epEntry ? [epEntry] : [];
     const ins = await env.DB.prepare(
       "INSERT INTO batches (group_key, quality, title, items_json, updated) VALUES (?, ?, ?, ?, ?)"
     ).bind(groupKey, quality, title, JSON.stringify(items), Date.now()).run();
     return ins.meta.last_row_id;
   }
 
+  if (!epEntry) return existing.batch_id;
+
   let items = [];
   try { items = JSON.parse(existing.items_json || "[]"); } catch (e) { items = []; }
 
-  const idx = items.findIndex((x) =>
-    x.rowId === epEntry.rowId || (epEntry.episode && x.season === epEntry.season && x.episode === epEntry.episode)
-  );
+  const idx = items.findIndex((x) => x.rowId === epEntry.rowId);
   if (idx >= 0) items[idx] = epEntry;
   else items.push(epEntry);
 
@@ -2861,37 +2819,41 @@ async function handleChannelPost(post, env) {
 
   let meta = null;
   let items = [];
-  let sampleRowId = existingPost ? JSON.parse(existingPost.meta_json || "{}").sampleRowId || null : null;
+  let sampleRowId = null;
 
   if (existingPost) {
     try { meta = JSON.parse(existingPost.meta_json || "null"); } catch (e) { meta = null; }
     try { items = JSON.parse(existingPost.items_json || "[]"); } catch (e) { items = []; }
+    if (meta && meta.sampleRowId) sampleRowId = meta.sampleRowId;
   } else {
     meta = await fetchMediaMeta(env, parsed);
   }
+  if (!meta) {
+    meta = {
+      title: parsed.cleanTitle,
+      year: parsed.year || "",
+      rating: "",
+      genres: "",
+      plot: "",
+      poster: "",
+      type: parsed.isSeries ? "TV Series" : "Movie",
+    };
+  }
+
+  const displayTitle = meta.title
+    ? (parsed.isSeries ? `${meta.title} S${String(parsed.season || 1).padStart(2, "0")}` : `${meta.title}${meta.year ? " " + meta.year : ""}`)
+    : (parsed.isSeries ? `${parsed.cleanTitle} S${String(parsed.season || 1).padStart(2, "0")}` : parsed.cleanTitle);
+
+  let batchId = null;
 
   if (isSample) {
     sampleRowId = rowId;
-    if (meta) meta.sampleRowId = sampleRowId;
+    meta.sampleRowId = sampleRowId;
+    batchId = await upsertSeasonBatch(env, parsed.groupKey, "ALL", displayTitle, null);
   } else {
-    const displayTitle = (meta && meta.title)
-      ? (parsed.isSeries ? `${meta.title} S${String(parsed.season || 1).padStart(2, "0")}` : meta.title)
-      : (parsed.isSeries ? `${parsed.cleanTitle} S${String(parsed.season || 1).padStart(2, "0")}` : parsed.cleanTitle);
-
-    let batchId = null;
-    if (parsed.isSeries) {
-      batchId = await upsertSeasonBatch(env, parsed.groupKey, parsed.quality, displayTitle, {
-        rowId,
-        season: parsed.season || 1,
-        episode: parsed.episode || (items.filter((x) => x.quality === parsed.quality).length + 1),
-        size: info.file.file_size || 0,
-        audioLangs: parsed.audioLangs,
-      });
-    }
-
     const newItem = {
       rowId,
-      batchId,
+      fileName: parsed.displayFileName,
       quality: parsed.quality,
       season: parsed.season,
       episode: parsed.episode,
@@ -2902,25 +2864,18 @@ async function handleChannelPost(post, env) {
       audioLangs: parsed.audioLangs,
     };
 
-    if (parsed.isSeries) {
-      const idx = items.findIndex((x) =>
-        x.rowId === rowId || (parsed.episode && x.quality === parsed.quality && x.episode === parsed.episode)
-      );
-      if (idx >= 0) items[idx] = newItem;
-      else items.push(newItem);
-    } else {
-      const fileSignature = `${parsed.quality}-${parsed.source}-${parsed.vCodec}`.toLowerCase();
-      const idx = items.findIndex((x) => {
-        const xSig = `${x.quality}-${x.source}-${x.vCodec}`.toLowerCase();
-        return x.rowId === rowId || xSig === fileSignature;
-      });
-      if (idx >= 0) items[idx] = newItem;
-      else items.push(newItem);
-    }
+    batchId = await upsertSeasonBatch(env, parsed.groupKey, "ALL", displayTitle, newItem);
+    newItem.batchId = batchId;
+
+    const idx = items.findIndex((x) => x.rowId === rowId);
+    if (idx >= 0) items[idx] = newItem;
+    else items.push(newItem);
   }
 
-  if (meta) meta.sampleRowId = sampleRowId;
-  const view = await buildChannelPostView(env, meta, parsed, items, showMediaInfo, sampleRowId);
+  meta.sampleRowId = sampleRowId;
+  meta.batchId = batchId;
+
+  const view = await buildChannelPostView(env, meta, parsed, items, showMediaInfo, sampleRowId, batchId);
 
   const chanMap = {};
   if (groupOn) {
@@ -3024,16 +2979,6 @@ async function handleChannelPost(post, env) {
       Date.now()
     ).run();
   }
-}
-
-// ---------- Constant-time string compare for webhook & HMAC ----------
-function safeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
 }
 
 // ---------- Constant-time string compare for webhook & HMAC ----------
