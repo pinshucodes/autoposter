@@ -250,46 +250,87 @@ async function sendFileToUser(env, chatId, row, skipNotice) {
   return sent.result.message_id;
 }
 
-// Sends Jarvis-style Season Batch Episode Picker inside the bot
-async function sendBatchMenuToUser(env, chatId, batch) {
+// Sends Paginated File / Episode Picker inside the bot (10 files per page + PREV/NEXT)
+async function sendBatchMenuToUser(env, chatId, batch, page = 0, editMsgId = null) {
   let items = [];
   try { items = JSON.parse(batch.items_json || "[]"); } catch (e) { items = []; }
-  items.sort((a, b) => (a.season || 1) - (b.season || 1) || (a.episode || 0) - (b.episode || 0));
 
   if (!items.length) {
-    await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, no episodes found in this batch." });
+    await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, no files found for this title." });
     return;
   }
 
+  // Sort series by Season/Episode, or movies by size (largest to smallest)
+  items.sort((a, b) => {
+    if (a.episode || b.episode) {
+      return (a.season || 1) - (b.season || 1) || (a.episode || 0) - (b.episode || 0) || (b.size || 0) - (a.size || 0);
+    }
+    return (b.size || 0) - (a.size || 0);
+  });
+
+  const perPage = 10;
+  const totalPages = Math.ceil(items.length / perPage);
+  const curPage = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = items.slice(curPage * perPage, (curPage + 1) * perPage);
+
   const lines = [
-    `🗂 <b>${esc(batch.title)} — ${esc(batch.quality)}</b>`,
-    `🔍 <b>Total Episodes:</b> ${items.length}`,
+    `📁 <b>Found ✨ ${items.length} Files For : #${esc(batch.title)} 👇</b>`,
+    `📄 <b>Page:</b> ${curPage + 1} of ${totalPages}`,
     "",
+    `🔻 <b>Choose your file from the buttons below to start downloading</b> 🔻`,
   ];
 
-  const buttons = [
-    [{ text: `📦 Send All ${items.length} Episodes (${batch.quality})`, callback_data: `ball:${batch.batch_id}` }],
-  ];
+  const buttons = [];
 
-  for (const ep of items) {
-    const sStr = `S${String(ep.season || 1).padStart(2, "0")}`;
-    const eStr = ep.episode ? `E${String(ep.episode).padStart(2, "0")}` : "EP";
-    const langTag = ep.audioLangs && ep.audioLangs.length ? ` • ${ep.audioLangs.slice(0, 2).join(" + ")}` : "";
-    lines.push(`📂 <b>${sStr} • ${eStr} • ${esc(batch.quality)}${esc(langTag)}</b> [${formatSize(ep.size)}]`);
+  for (const ep of slice) {
+    const sizeStr = formatSize(ep.size);
+    let label = ep.fileName || "";
+    if (!label) {
+      const sStr = ep.season ? `S${String(ep.season).padStart(2, "0")}` : "";
+      const eStr = ep.episode ? `E${String(ep.episode).padStart(2, "0")}` : "";
+      const seTag = (sStr || eStr) ? `${sStr}${eStr} • ` : "";
+      const langTag = ep.audioLangs && ep.audioLangs.length ? ` • ${ep.audioLangs.join("+")}` : "";
+      label = `${seTag}${ep.quality || "HD"}${langTag}`;
+    }
     buttons.push([{
-      text: `⬇️ GET ${sStr} • ${eStr} • ${batch.quality} [${formatSize(ep.size)}]`,
+      text: `${sizeStr} - ${label}`.slice(0, 62),
       callback_data: `bep:${ep.rowId}`,
     }]);
+  }
+
+  if (totalPages > 1) {
+    const navRow = [];
+    if (curPage > 0) {
+      navRow.push({ text: "⏪ PREVIOUS", callback_data: `bpage:${batch.batch_id}:${curPage - 1}` });
+    }
+    if (curPage < totalPages - 1) {
+      navRow.push({ text: "⏩ NEXT", callback_data: `bpage:${batch.batch_id}:${curPage + 1}` });
+    }
+    if (navRow.length) buttons.push(navRow);
+  }
+
+  if (items.length > 1 && items.length <= 15) {
+    buttons.push([{ text: `📦 Send All ${items.length} Files`, callback_data: `ball:${batch.batch_id}` }]);
+  }
+
+  if (editMsgId) {
+    await tg(env, "editMessageText", {
+      chat_id: chatId,
+      message_id: editMsgId,
+      text: lines.join("\n"),
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: buttons },
+    });
+    return;
   }
 
   const sent = await tg(env, "sendMessage", {
     chat_id: chatId,
     text: lines.join("\n"),
     parse_mode: "HTML",
-    reply_markup: { inline_keyboard: buttons.slice(0, 98) },
+    reply_markup: { inline_keyboard: buttons },
   });
 
-  // Also auto-delete the batch menu after 5 minutes to keep chat clean
   const rawMins = await getSetting(env, "delete_minutes");
   const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
   if (mins && sent.ok) {
