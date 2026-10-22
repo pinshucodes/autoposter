@@ -309,7 +309,7 @@ async function sendBatchMenuToUser(env, chatId, batch, page = 0, editMsgId = nul
     if (navRow.length) buttons.push(navRow);
   }
 
-  if (items.length > 1 && items.length <= 15) {
+  if (items.length > 1) {
     buttons.push([{ text: `📦 Send All ${items.length} Files`, callback_data: `ball:${batch.batch_id}` }]);
   }
 
