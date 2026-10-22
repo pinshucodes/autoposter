@@ -546,18 +546,34 @@ const MAIN_MENU = {
 const SUB_MENUS = {};
 const BACK_BUTTON = [[{ text: "⬅️ Back", callback_data: "back" }]];
 
-async function buildRoleMenu(env, role) {
+async function buildRoleMenu(env, role, page = 0) {
   const info = ROLES[role];
   const channels = await getChannels(env, role);
 
-  let text = `${info.emoji} <b>${info.name}</b>\n\n${info.help}\n\n`;
-  text += channels.length
-    ? channels.map((c) => `• ${esc(c.title)} (<code>${c.chat_id}</code>)`).join("\n")
-    : "<i>None set yet.</i>";
+  const perPage = 10;
+  const totalPages = Math.max(1, Math.ceil(channels.length / perPage));
+  const curPage = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = channels.slice(curPage * perPage, (curPage + 1) * perPage);
 
-  const buttons = channels.map((c) => [
-    { text: `🗑 Remove ${c.title}`.slice(0, 60), callback_data: `rm:${role}:${c.chat_id}` },
+  let text = `${info.emoji} <b>${info.name}</b> (${channels.length}${info.max ? `/${info.max}` : ""})\n\n${info.help}\n\n`;
+  if (channels.length) {
+    text += `📄 <b>Page ${curPage + 1} of ${totalPages}</b>\n`;
+    text += slice.map((c, idx) => `${curPage * perPage + idx + 1}. ${esc(c.title)} (<code>${c.chat_id}</code>)`).join("\n");
+  } else {
+    text += "<i>None set yet.</i>";
+  }
+
+  const buttons = slice.map((c) => [
+    { text: `🗑 Remove ${c.title}`.slice(0, 60), callback_data: `rm:${role}:${curPage}:${c.chat_id}` },
   ]);
+
+  if (totalPages > 1) {
+    const nav = [];
+    if (curPage > 0) nav.push({ text: "⏪ Prev", callback_data: `role:${role}:${curPage - 1}` });
+    if (curPage < totalPages - 1) nav.push({ text: "⏩ Next", callback_data: `role:${role}:${curPage + 1}` });
+    if (nav.length) buttons.push(nav);
+  }
+
   if (!info.max || channels.length < info.max) {
     const addLabel = info.multi ? "➕ Add Channel" : channels.length ? "🔄 Change Channel" : "➕ Set Channel";
     buttons.push([{ text: addLabel, callback_data: `add:${role}` }]);
@@ -567,8 +583,8 @@ async function buildRoleMenu(env, role) {
   return { text, buttons };
 }
 
-async function showRoleMenu(env, chatId, messageId, role) {
-  const menu = await buildRoleMenu(env, role);
+async function showRoleMenu(env, chatId, messageId, role, page = 0) {
+  const menu = await buildRoleMenu(env, role, page);
   await tg(env, "editMessageText", {
     chat_id: chatId,
     message_id: messageId,
