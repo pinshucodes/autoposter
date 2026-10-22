@@ -670,6 +670,7 @@ async function buildMetaMenu(env, note) {
   const protectOn = (await getSetting(env, "protect_files")) === "1"; // OFF by default so users can forward/share
   const tmdbKey = await getSetting(env, "tmdb_key");
   const omdbKey = await getSetting(env, "omdb_key");
+  const sampleUrl = await getSetting(env, "sample_url");
 
   let text = "🎬 <b>IMDb, TMDb, Series Batching & Shield</b>\n\n" +
     "• <b>Combine Qualities & Series Seasons:</b> Merges 480p, 720p, 1080p, 4K of a Movie or an entire TV Season into ONE channel post. Tapping 720p on a series opens the Jarvis-style Episode Batch list!\n" +
@@ -682,7 +683,8 @@ async function buildMetaMenu(env, note) {
     `🛡️ Worker Redirect Shield: ${shieldOn ? "✅ ON" : "❌ OFF"}\n` +
     `🔒 Lock File Forwarding: ${protectOn ? "✅ ON (No Share)" : "❌ OFF (Users Can Share)"}\n\n` +
     `TMDb Key: ${tmdbKey ? "<code>" + esc(tmdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n` +
-    `OMDb (IMDb) Key: ${omdbKey ? "<code>" + esc(omdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}`;
+    `OMDb (IMDb) Key: ${omdbKey ? "<code>" + esc(omdbKey.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n` +
+    `🎬 Sample Channel Link: ${sampleUrl ? esc(sampleUrl) : "<i>not set</i>"}`;
   if (note) text += `\n\n${note}`;
 
   const buttons = [
@@ -697,11 +699,12 @@ async function buildMetaMenu(env, note) {
       { text: "🔑 Set TMDb Key", callback_data: "meta:tmdb" },
       { text: "🔑 Set OMDb Key", callback_data: "meta:omdb" },
     ],
-    ...BACK_BUTTON,
+    [{ text: sampleUrl ? "🎬 Change Sample Channel Link" : "🎬 Set Sample Channel Link", callback_data: "meta:sample" }],
   ];
+  if (sampleUrl) buttons.push([{ text: "🗑 Remove Sample Link", callback_data: "meta:rmsample" }]);
+  buttons.push(...BACK_BUTTON);
   return { text, buttons };
 }
-
 // ---------- Shortlink & Tutorial settings menu ----------
 async function buildShortlinkMenu(env, note) {
   const domain = await getSetting(env, "shortlink_domain");
