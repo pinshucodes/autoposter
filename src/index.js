@@ -852,22 +852,25 @@ async function handleSettingInput(env, msg, field) {
     });
     return;
   }
-  if (field === "tutorial_url") {
-    if (!/^https?:\/\/\S+/i.test(value)) {
+  if (field === "tutorial_url" || field === "sample_url") {
+    if (!/^https?:\/\/\S+/i.test(value) && !/^@\w+$/i.test(value)) {
       await tg(env, "sendMessage", {
         chat_id: chatId,
-        text: "Please send a valid link starting with https:// (like https://t.me/yourchannel/123), or /cancel.",
+        text: "Please send a valid channel link starting with https:// (like https://t.me/yourchannel) or @username, or /cancel.",
       });
       return;
     }
-    await setSetting(env, "tutorial_url", value);
+    if (value.startsWith("@")) value = `https://t.me/${value.slice(1)}`;
+    await setSetting(env, field, value);
     await clearState(env, userId);
-    const smenu = await buildShortlinkMenu(env, "✅ Tutorial link saved!");
+    const menu = field === "sample_url"
+      ? await buildMetaMenu(env, "✅ Sample channel link saved!")
+      : await buildShortlinkMenu(env, "✅ Tutorial link saved!");
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: smenu.text,
+      text: menu.text,
       parse_mode: "HTML",
-      reply_markup: { inline_keyboard: smenu.buttons },
+      reply_markup: { inline_keyboard: menu.buttons },
     });
     return;
   }
