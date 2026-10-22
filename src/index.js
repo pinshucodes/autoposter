@@ -2730,7 +2730,10 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
 
   const buttons = [];
 
-  if (sampleRowId) {
+  const sampleChannelUrl = await getSetting(env, "sample_url");
+  if (sampleChannelUrl) {
+    buttons.push([{ text: "🎬 Watch Sample Video", url: sampleChannelUrl }]);
+  } else if (sampleRowId) {
     const sampleLink = await makeDeepLink(env, `f${sampleRowId}`);
     buttons.push([{ text: "🎬 Watch Sample Video", url: sampleLink }]);
   }
