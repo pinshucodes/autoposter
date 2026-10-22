@@ -2188,7 +2188,8 @@ async function handleButton(query, env) {
 
   if (action === "role" && ROLES[parts[1]]) {
     await clearState(env, userId);
-    await showRoleMenu(env, chatId, messageId, parts[1]);
+    const page = Number.isInteger(Number(parts[2])) ? Number(parts[2]) : 0;
+    await showRoleMenu(env, chatId, messageId, parts[1], page);
     return;
   }
 
