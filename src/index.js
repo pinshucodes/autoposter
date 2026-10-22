@@ -2378,11 +2378,14 @@ async function handleButton(query, env) {
   // IMDb, TMDb, Multi-Quality & Shield settings
   if (action === "meta") {
     const sub = parts[1];
-    if (sub === "tmdb" || sub === "omdb") {
-      await setState(env, userId, `set:${sub}_key`);
+    if (sub === "tmdb" || sub === "omdb" || sub === "sample") {
+      const fieldName = sub === "sample" ? "sample_url" : `${sub}_key`;
+      await setState(env, userId, `set:${fieldName}`);
       const prompt = sub === "tmdb"
         ? "🔑 Send your <b>TMDb API Key (v3 auth)</b> from themoviedb.org.\n\nI'll delete your message right after saving it."
-        : "🔑 Send your <b>OMDb API Key</b> from omdbapi.com.\n\nI'll delete your message right after saving it.";
+        : sub === "omdb"
+        ? "🔑 Send your <b>OMDb API Key</b> from omdbapi.com.\n\nI'll delete your message right after saving it."
+        : "🎬 Send your <b>Sample Channel Link</b> (like <code>https://t.me/yoursamplechannel</code> or <code>@yoursamplechannel</code>).\n\nThis button will appear on all Movie & Series posts.";
       await tg(env, "editMessageText", {
         chat_id: chatId,
         message_id: messageId,
@@ -2393,6 +2396,10 @@ async function handleButton(query, env) {
       return;
     }
     let note = "";
+    if (sub === "rmsample") {
+      await env.DB.prepare("DELETE FROM settings WHERE key = 'sample_url'").run();
+      note = "🗑 Sample channel link removed.";
+    }
     if (sub === "toggle") {
       const on = (await getSetting(env, "meta_enabled")) === "1";
       if (on) {
