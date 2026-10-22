@@ -2210,8 +2210,10 @@ async function handleButton(query, env) {
   }
 
   if (action === "rm" && ROLES[parts[1]]) {
-    await removeChannel(env, parts[1], parts.slice(2).join(":"));
-    await showRoleMenu(env, chatId, messageId, parts[1]);
+    const page = Number.isInteger(Number(parts[2])) ? Number(parts[2]) : 0;
+    const targetChatId = Number.isInteger(Number(parts[2])) ? parts.slice(3).join(":") : parts.slice(2).join(":");
+    await removeChannel(env, parts[1], targetChatId);
+    await showRoleMenu(env, chatId, messageId, parts[1], page);
     return;
   }
 
