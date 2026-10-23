@@ -1987,7 +1987,17 @@ async function handleMessage(msg, env) {
     await tg(env, "sendMessage", { chat_id: chatId, text: r.meta.changes ? "🛑 Broadcast stopped." : "No broadcast is running." });
     return;
   }
-
+  
+  if (text.startsWith("/digest")) {
+    await clearState(env, userId);
+    const res = await sendDailyDigest(env, { tg, getChannels, getSetting, makeDeepLink });
+    const messageText = res.ok 
+      ? `✅ Daily Digest posted to ${res.sentCount} ForceSub channel(s) (${res.totalUploads} titles).`
+      : `⚠️ Could not post digest: ${res.reason}`;
+    await tg(env, "sendMessage", { chat_id: chatId, text: messageText });
+    return;
+  }
+  
   if (text.startsWith("/stats")) {
     await clearState(env, userId);
     await sendStats(env, chatId);
