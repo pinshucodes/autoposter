@@ -1141,6 +1141,9 @@ async function runCron(env) {
     const job = await env.DB.prepare("SELECT 1 AS x FROM broadcasts WHERE status = 'running' LIMIT 1").first();
     await runDeletions(env, job ? 15 : 40);
     if (job) await processBroadcast(env, 30);
+
+    // Automatically posts the Daily Digest at 7:00 PM IST
+    await checkAndRunScheduledDigest(env, { tg, getChannels, getSetting, setSetting, makeDeepLink });
   } catch (err) {
     console.log("Cron error:", err);
     await alertOwner(env, "cron", `The scheduled cleanup job hit an error: ${String(err).slice(0, 300)}`);
