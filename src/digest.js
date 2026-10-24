@@ -2,6 +2,13 @@
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+const QUALITY_ORDER = ["360p", "480p", "720p", "1080p", "1440p", "2160p 4K", "HD"];
+function sortQualities(a, b) {
+  const ia = QUALITY_ORDER.indexOf(a);
+  const ib = QUALITY_ORDER.indexOf(b);
+  return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+}
+
 /**
  * Builds and posts the Style A Daily Digest to all ForceSub channels.
  */
@@ -23,7 +30,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDe
     return { ok: false, reason: "No new movies or series uploaded in the last 24 hours." };
   }
 
-  // 3. Format today's IST date (e.g., "23 Oct 2026")
+  // 3. Format today's IST date (e.g., "24 Oct 2026")
   const istNow = new Date(Date.now() + 330 * 60000);
   const dateLabel = istNow.toUTCString().split(" ").slice(1, 4).join(" ");
 
@@ -33,12 +40,15 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDe
     "",
   ];
 
-  // 4. Build Style A: Title on line 1, dark clickable pill badge(s) on line 2
+  // 4. Build Style A: Title on line 1, clickable dark blockquote pill on line 2
   let count = 0;
   for (const b of batches) {
     count++;
     const isSeries = String(b.group_key || "").startsWith("series:");
     const icon = isSeries ? "📺" : "🎬";
+
+    // Clean any accidental line breaks inside the title
+    const cleanTitle = String(b.title || "Untitled").replace(/\s+/g, " ").trim();
 
     let items = [];
     try { items = JSON.parse(b.items_json || "[]"); } catch (_) { items = []; }
@@ -47,18 +57,20 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDe
     for (const it of items) {
       if (it.quality && !quals.includes(it.quality)) quals.push(it.quality);
     }
+    quals.sort(sortQualities);
+
     const qualTag = quals.length ? ` (${quals.join(" | ")})` : "";
     const deepLink = await makeDeepLink(env, `b${b.batch_id}`);
 
-    // Line 1: Number + Title + Qualities
-    lines.push(`<b>${count}. ${icon} ${esc(b.title)}</b><i>${esc(qualTag)}</i>`);
+    // Line 1: Number + Title + Sorted Qualities
+    lines.push(`<b>${count}. ${icon} ${esc(cleanTitle)}</b><i>${esc(qualTag)}</i>`);
 
-    // Line 2: Dark pill badge with ↗ arrow (Style A)
+    // Line 2: Clickable pill box that opens the bot directly without copying text
     const pillLabel = isSeries && items.length > 1
       ? `📥 All ${items.length} Episodes ↗`
       : `📥 Get File ↗`;
 
-    lines.push(`<a href="${deepLink}"><code> ${pillLabel} </code></a>\n`);
+    lines.push(`<blockquote><a href="${deepLink}"><b>${pillLabel}</b></a></blockquote>\n`);
   }
 
   lines.push(`🔔 <i>Stay joined for daily 7:00 PM upload updates!</i>`);
