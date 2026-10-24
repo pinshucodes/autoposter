@@ -1,4 +1,4 @@
-// digest.js - Daily 7:00 PM IST Upload Digest for ForceSub Channels
+// src/digest.js - Daily 7:00 PM IST Upload Digest for ForceSub Channels
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -9,17 +9,27 @@ function sortQualities(a, b) {
   return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
 }
 
-/**
- * Builds and posts the Style A Daily Digest to all ForceSub channels.
- */
-export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDeepLink }) {
+export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSetting }) {
   // 1. Get all ForceSub channels
   const forcesubChannels = await getChannels(env, "forcesub");
   if (!forcesubChannels.length) {
     return { ok: false, reason: "No ForceSub channels set in /settings." };
   }
 
-  // 2. Get all Movie & Series batches updated in the last 24 hours
+  // 2. Always get a valid Bot Username so https://t.me/ links NEVER fail
+  let username = await getSetting(env, "bot_username");
+  if (!username) {
+    const me = await tg(env, "getMe", {});
+    if (me.ok && me.result && me.result.username) {
+      username = me.result.username;
+      if (setSetting) await setSetting(env, "bot_username", username);
+    }
+  }
+  if (!username) {
+    return { ok: false, reason: "Could not fetch bot username from Telegram." };
+  }
+
+  // 3. Get all Movie & Series batches updated in the last 24 hours
   const since = Date.now() - 24 * 60 * 60 * 1000;
   const rows = await env.DB.prepare(
     "SELECT batch_id, group_key, title, items_json, updated FROM batches WHERE updated >= ? ORDER BY updated DESC LIMIT 30"
@@ -30,25 +40,25 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDe
     return { ok: false, reason: "No new movies or series uploaded in the last 24 hours." };
   }
 
-  // 3. Format today's IST date (e.g., "24 Oct 2026")
+  // 4. Format today's IST date (e.g., "24 Oct 2026")
   const istNow = new Date(Date.now() + 330 * 60000);
   const dateLabel = istNow.toUTCString().split(" ").slice(1, 4).join(" ");
 
   const lines = [
     `📅 <b>Today's Uploads (${esc(dateLabel)})</b>`,
-    `<i>Tap any button below a title to get the file directly in bot PM:</i>`,
+    `<i>Tap any blue link below a title to get the file directly in bot PM:</i>`,
     "",
   ];
 
-  // 4. Build Style A: Title on line 1, clickable dark blockquote pill on line 2
+  // 5. Build each Movie/Series entry with a direct t.me clickable link
   let count = 0;
   for (const b of batches) {
     count++;
     const isSeries = String(b.group_key || "").startsWith("series:");
     const icon = isSeries ? "📺" : "🎬";
 
-    // Clean any accidental line breaks inside the title
-    const cleanTitle = String(b.title || "Untitled").replace(/\s+/g, " ").trim();
+    // Remove any accidental line breaks inside the title
+    const cleanTitle = String(b.title || "Untitled").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
 
     let items = [];
     try { items = JSON.parse(b.items_json || "[]"); } catch (_) { items = []; }
@@ -60,17 +70,19 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDe
     quals.sort(sortQualities);
 
     const qualTag = quals.length ? ` (${quals.join(" | ")})` : "";
-    const deepLink = await makeDeepLink(env, `b${b.batch_id}`);
 
-    // Line 1: Number + Title + Sorted Qualities
-    lines.push(`<b>${count}. ${icon} ${esc(cleanTitle)}</b><i>${esc(qualTag)}</i>`);
+    // Direct Telegram Bot Deep Link (Opens Bot immediately with 1 tap!)
+    const botUrl = `https://t.me/${username}?start=b${b.batch_id}`;
 
-    // Line 2: Clickable pill box that opens the bot directly without copying text
-    const pillLabel = isSeries && items.length > 1
+    const btnLabel = isSeries && items.length > 1
       ? `📥 All ${items.length} Episodes ↗`
       : `📥 Get File ↗`;
 
-    lines.push(`<blockquote><a href="${deepLink}"><b>${pillLabel}</b></a></blockquote>\n`);
+    // Line 1: Number + Title + Qualities
+    lines.push(`<b>${count}. ${icon} ${esc(cleanTitle)}</b><i>${esc(qualTag)}</i>`);
+
+    // Line 2: Clickable Quote Pill with direct Bot Link (NO <code> tag so it never copies!)
+    lines.push(`<blockquote>👉 <a href="${botUrl}"><b>${btnLabel}</b></a></blockquote>\n`);
   }
 
   lines.push(`🔔 <i>Stay joined for daily 7:00 PM upload updates!</i>`);
@@ -103,9 +115,6 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, makeDe
   return { ok: true, sentCount, totalUploads: count };
 }
 
-/**
- * Automatically triggers the digest once per day during the 7:00 PM IST hour (19:00 IST).
- */
 export async function checkAndRunScheduledDigest(env, helpers) {
   const istDate = new Date(Date.now() + 330 * 60000);
   const istHour = istDate.getUTCHours(); // 19 = 7:00 PM IST
@@ -114,7 +123,7 @@ export async function checkAndRunScheduledDigest(env, helpers) {
   if (istHour !== 19) return;
 
   const lastSent = await helpers.getSetting(env, "last_digest_day");
-  if (lastSent === todayStr) return; // Already posted today
+  if (lastSent === todayStr) return;
 
   await helpers.setSetting(env, "last_digest_day", todayStr);
   await sendDailyDigest(env, helpers);
