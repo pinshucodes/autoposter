@@ -1,4 +1,4 @@
-// src/digest.js - Daily 7:00 PM IST Upload Digest for ForceSub Channels
+// src/digest.js - Daily 7:00 PM IST Upload Digest (with Audio Languages + Anti-Copy Lock)
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -46,42 +46,47 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
 
   const lines = [
     `📅 <b>Today's Uploads (${esc(dateLabel)})</b>`,
-    `<i>Tap any blue link below a title to get the file directly in bot PM:</i>`,
+    `<i>Tap any blue button below a title to get the file directly in bot PM:</i>`,
     "",
   ];
 
-  // 5. Build each Movie/Series entry with a direct t.me clickable link
+  // 5. Build each Movie/Series entry with Qualities + Audio Languages + Direct Bot Link
   let count = 0;
   for (const b of batches) {
     count++;
     const isSeries = String(b.group_key || "").startsWith("series:");
     const icon = isSeries ? "📺" : "🎬";
 
-    // Remove any accidental line breaks inside the title
+    // Clean any accidental line breaks inside the title
     const cleanTitle = String(b.title || "Untitled").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
 
     let items = [];
     try { items = JSON.parse(b.items_json || "[]"); } catch (_) { items = []; }
 
     const quals = [];
+    const langs = [];
     for (const it of items) {
       if (it.quality && !quals.includes(it.quality)) quals.push(it.quality);
+      for (const l of it.audioLangs || []) {
+        if (l && !langs.includes(l)) langs.push(l);
+      }
     }
     quals.sort(sortQualities);
 
     const qualTag = quals.length ? ` (${quals.join(" | ")})` : "";
+    const langLine = langs.length ? `\n🔊 <i>${esc(langs.join(" + "))}</i>` : "";
 
-    // Direct Telegram Bot Deep Link (Opens Bot immediately with 1 tap!)
+    // Direct Telegram Bot Deep Link
     const botUrl = `https://t.me/${username}?start=b${b.batch_id}`;
 
     const btnLabel = isSeries && items.length > 1
       ? `📥 All ${items.length} Episodes ↗`
       : `📥 Get File ↗`;
 
-    // Line 1: Number + Title + Qualities
-    lines.push(`<b>${count}. ${icon} ${esc(cleanTitle)}</b><i>${esc(qualTag)}</i>`);
+    // Line 1: Number + Title + Qualities (+ Audio Languages if detected)
+    lines.push(`<b>${count}. ${icon} ${esc(cleanTitle)}</b><i>${esc(qualTag)}</i>${langLine}`);
 
-    // Line 2: Clickable Quote Pill with direct Bot Link (NO <code> tag so it never copies!)
+    // Line 2: Clickable Quote Pill with direct Bot Link
     lines.push(`<blockquote>👉 <a href="${botUrl}"><b>${btnLabel}</b></a></blockquote>\n`);
   }
 
@@ -99,6 +104,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
         photo: cover,
         caption: text,
         parse_mode: "HTML",
+        protect_content: true, // Blocks copying links/text and forwarding
       });
     }
     if (!res || !res.ok) {
@@ -107,6 +113,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
         text,
         parse_mode: "HTML",
         disable_web_page_preview: true,
+        protect_content: true, // Blocks copying links/text and forwarding
       });
     }
     if (res && res.ok) sentCount++;
