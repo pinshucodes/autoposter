@@ -2814,6 +2814,8 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
   }
 
   return { caption: lines.join("\n"), buttons };
+}
+
 // ---------- Upsert Master Batch in D1 (Used for both Movies & Series) ----------
 async function upsertSeasonBatch(env, groupKey, quality, title, epEntry) {
   await ensureExtraTables(env);
