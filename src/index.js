@@ -2791,6 +2791,7 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
 
   const buttons = [];
 
+  // 1. Sample Button
   const sampleChannelUrl = await getSetting(env, "sample_url");
   if (sampleChannelUrl) {
     buttons.push([{ text: "🎬 Watch Sample Video", url: sampleChannelUrl }]);
@@ -2799,15 +2800,20 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
     buttons.push([{ text: "🎬 Watch Sample Video", url: sampleLink }]);
   }
 
+  // 2. Download Button
   if (batchId) {
     const dlLink = await makeDeepLink(env, `b${batchId}`);
     const countLabel = items.length > 1 ? ` (${items.length} Files)` : "";
     buttons.push([{ text: `📥 Download Now${countLabel}`, url: dlLink }]);
   }
 
-  return { caption: lines.join("\n"), buttons };
-}
+  // 3. How to Download Button (from your tutorial_url setting)
+  const tutorialUrl = await getSetting(env, "tutorial_url");
+  if (tutorialUrl) {
+    buttons.push([{ text: "❓ How to Download", url: tutorialUrl }]);
+  }
 
+  return { caption: lines.join("\n"), buttons };
 // ---------- Upsert Master Batch in D1 (Used for both Movies & Series) ----------
 async function upsertSeasonBatch(env, groupKey, quality, title, epEntry) {
   await ensureExtraTables(env);
