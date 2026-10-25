@@ -2895,9 +2895,10 @@ async function handleChannelPost(post, env) {
     return;
   }
 
-  const targets = (await getChannels(env, "lectures")).slice(0, 50);
+  const rawTargets = (await getChannels(env, "lectures")).slice(0, 50);
+  const { isTestMode, targets } = await resolveTargetChannels(env, rawTargets, getSetting);
   if (!targets.length) return;
-
+  if (isTestMode) parsed.groupKey = `test_${parsed.groupKey}`;
   await ensureExtraTables(env);
   const fullText = `${info.name || ""} ${post.caption || ""}`;
   const isSample = /\bsample\b/i.test(fullText);
