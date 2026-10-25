@@ -1,4 +1,4 @@
-// src/digest.js - Daily 7:00 PM IST Upload Digest (with Audio Languages + Anti-Copy Lock)
+// src/digest.js - Daily 7:00 PM IST Upload Digest for ForceSub Channels
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -16,7 +16,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
     return { ok: false, reason: "No ForceSub channels set in /settings." };
   }
 
-  // 2. Always get a valid Bot Username so https://t.me/ links NEVER fail
+  // 2. Always get a valid Bot Username
   let username = await getSetting(env, "bot_username");
   if (!username) {
     const me = await tg(env, "getMe", {});
@@ -40,7 +40,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
     return { ok: false, reason: "No new movies or series uploaded in the last 24 hours." };
   }
 
-  // 4. Format today's IST date (e.g., "24 Oct 2026")
+  // 4. Format today's IST date
   const istNow = new Date(Date.now() + 330 * 60000);
   const dateLabel = istNow.toUTCString().split(" ").slice(1, 4).join(" ");
 
@@ -50,14 +50,13 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
     "",
   ];
 
-  // 5. Build each Movie/Series entry with Qualities + Audio Languages + Direct Bot Link
+  // 5. Build each Movie/Series entry with Qualities + Audio Languages + Quote Pill Link
   let count = 0;
   for (const b of batches) {
     count++;
     const isSeries = String(b.group_key || "").startsWith("series:");
     const icon = isSeries ? "📺" : "🎬";
 
-    // Clean any accidental line breaks inside the title
     const cleanTitle = String(b.title || "Untitled").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
 
     let items = [];
@@ -76,23 +75,23 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
     const qualTag = quals.length ? ` (${quals.join(" | ")})` : "";
     const langLine = langs.length ? `\n🔊 <i>${esc(langs.join(" + "))}</i>` : "";
 
-    // Direct Telegram Bot Deep Link
     const botUrl = `https://t.me/${username}?start=b${b.batch_id}`;
-
     const btnLabel = isSeries && items.length > 1
       ? `📥 All ${items.length} Episodes ↗`
       : `📥 Get File ↗`;
 
-    // Line 1: Number + Title + Qualities (+ Audio Languages if detected)
     lines.push(`<b>${count}. ${icon} ${esc(cleanTitle)}</b><i>${esc(qualTag)}</i>${langLine}`);
-
-    // Line 2: Clickable Quote Pill with direct Bot Link
     lines.push(`<blockquote>👉 <a href="${botUrl}"><b>${btnLabel}</b></a></blockquote>\n`);
   }
 
+  // 6. Bottom "How to Download" Blockquote Pill (Right where you circled!)
+  const tutorialUrl = await getSetting(env, "tutorial_url");
   lines.push(`🔔 <i>Stay joined for daily 7:00 PM upload updates!</i>`);
-  const text = lines.join("\n");
+  if (tutorialUrl) {
+    lines.push(`<blockquote>🎬 <a href="${tutorialUrl}"><b>How to Download (Tutorial) ↗</b></a></blockquote>`);
+  }
 
+  const text = lines.join("\n");
   const cover = await getSetting(env, "cover_lecture");
   let sentCount = 0;
 
@@ -104,7 +103,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
         photo: cover,
         caption: text,
         parse_mode: "HTML",
-        protect_content: true, // Blocks copying links/text and forwarding
+        protect_content: true,
       });
     }
     if (!res || !res.ok) {
@@ -113,7 +112,7 @@ export async function sendDailyDigest(env, { tg, getChannels, getSetting, setSet
         text,
         parse_mode: "HTML",
         disable_web_page_preview: true,
-        protect_content: true, // Blocks copying links/text and forwarding
+        protect_content: true,
       });
     }
     if (res && res.ok) sentCount++;
