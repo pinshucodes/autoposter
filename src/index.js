@@ -477,54 +477,82 @@ async function ensureLink(env, c) {
   return link;
 }
 
-// Delivers a single file ( checks ForceSub -> Shortlink -> Sends File )
-async function deliverFile(env, chatId, userId, row, verified) {
-  const missing = await getMissingChannels(env, userId);
-  if (!missing.length) {
-    if (!verified && (await shortlinkReady(env)) && !(await hasActiveSub(env, userId))) {
-      await sendVerifyLink(env, chatId, userId, row.id, row.title);
-      return;
-    }
-    await sendFileToUser(env, chatId, row);
-    return;
-  }
-  const buttons = [];
-  for (const c of missing) {
-    const link = await ensureLink(env, c);
-    if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
-  }
-  buttons.push([{ text: "✅ I've Joined", callback_data: `chk:${row.id}` }]);
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: "🔐 To get this file, please join the channel(s) below, then tap <b>I've Joined</b>.",
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: buttons },
-  });
+// Checks if user has verified within the last 6 hours (or has paid Premium)
+async function isVerifiedLast6Hours(env, userId) {
+  if (await hasActiveSub(env, userId)) return true;
+  const r = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
+    .bind(`vpass_${userId}`).first();
+  return r && Number(r.value) > Date.now();
 }
 
-// Delivers a Series Season Batch ( checks ForceSub -> Shortlink -> Opens Jarvis-style Episode List )
-async function deliverBatch(env, chatId, userId, batch, verified) {
-  const missing = await getMissingChannels(env, userId);
-  if (!missing.length) {
-    if (!verified && (await shortlinkReady(env)) && !(await hasActiveSub(env, userId))) {
-      await sendVerifyLink(env, chatId, userId, -batch.batch_id, `${batch.title} (${batch.quality})`);
-      return;
-    }
-    await sendBatchMenuToUser(env, chatId, batch);
+// 1. Verify FIRST (valid for 6 hours) -> 2. Check ForceSub SECOND -> 3. Send File
+async function deliverFile(env, chatId, userId, row, justVerified) {
+  if (justVerified) {
+    // Save 6-hour verification pass for this user!
+    await setSetting(env, `vpass_${userId}`, String(Date.now() + 6 * 3600 * 1000));
+  }
+
+  // STEP 1: Check 6-Hour Verification Pass FIRST
+  if (!justVerified && (await shortlinkReady(env)) && !(await isVerifiedLast6Hours(env, userId))) {
+    await sendVerifyLink(env, chatId, userId, row.id, row.title);
     return;
   }
-  const buttons = [];
-  for (const c of missing) {
-    const link = await ensureLink(env, c);
-    if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
+
+  // STEP 2: After Verification, check ForceSub Channel(s)
+  const missing = await getMissingChannels(env, userId);
+  if (missing.length) {
+    const buttons = [];
+    for (const c of missing) {
+      const link = await ensureLink(env, c);
+      if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
+    }
+    buttons.push([{ text: "🔄 Try Again / Get File", callback_data: `chk:${row.id}` }]);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "✅ <b>Verification Active (6 Hours)!</b>\n\n🔐 Now join our backup channel(s) below and tap <b>Try Again / Get File</b> to receive your file instantly:",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: buttons },
+    });
+    return;
   }
-  buttons.push([{ text: "✅ I've Joined", callback_data: `chkb:${batch.batch_id}` }]);
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: "🔐 To access this season batch, please join the channel(s) below, then tap <b>I've Joined</b>.",
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: buttons },
-  });
+
+  // STEP 3: Send File Immediately
+  await sendFileToUser(env, chatId, row);
+}
+
+// 1. Verify FIRST (valid for 6 hours) -> 2. Check ForceSub SECOND -> 3. Open Episode/Quality Menu
+async function deliverBatch(env, chatId, userId, batch, justVerified) {
+  if (justVerified) {
+    // Save 6-hour verification pass for this user!
+    await setSetting(env, `vpass_${userId}`, String(Date.now() + 6 * 3600 * 1000));
+  }
+
+  // STEP 1: Check 6-Hour Verification Pass FIRST
+  if (!justVerified && (await shortlinkReady(env)) && !(await isVerifiedLast6Hours(env, userId))) {
+    await sendVerifyLink(env, chatId, userId, -batch.batch_id, `${batch.title} (${batch.quality})`);
+    return;
+  }
+
+  // STEP 2: After Verification, check ForceSub Channel(s)
+  const missing = await getMissingChannels(env, userId);
+  if (missing.length) {
+    const buttons = [];
+    for (const c of missing) {
+      const link = await ensureLink(env, c);
+      if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
+    }
+    buttons.push([{ text: "🔄 Try Again / Get Files", callback_data: `chkb:${batch.batch_id}` }]);
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "✅ <b>Verification Active (6 Hours)!</b>\n\n🔐 Now join our backup channel(s) below and tap <b>Try Again / Get Files</b> to unlock all files:",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: buttons },
+    });
+    return;
+  }
+
+  // STEP 3: Open File/Episode Picker Immediately
+  await sendBatchMenuToUser(env, chatId, batch);
 }
 
 // ---------- Menus ----------
