@@ -1,4 +1,5 @@
 import { sendDailyDigest, checkAndRunScheduledDigest } from "./digest.js";
+import { handleTestCommand, resolveTargetChannels } from "./testmode.js";
 // Autoposter Bot - Movie & Series Season Batching + Anti-Bypass Shortlink Shield + IMDb/TMDb/MediaInfo
 // Runs on Cloudflare Workers + D1 database.
 //
