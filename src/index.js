@@ -2017,6 +2017,12 @@ async function handleMessage(msg, env) {
     return;
   }
   
+  if (text.startsWith("/test")) {
+    await clearState(env, userId);
+    await handleTestCommand(env, chatId, text, { tg, getSetting, setSetting });
+    return;
+  }
+  
   if (text.startsWith("/digest")) {
     await clearState(env, userId);
     const res = await sendDailyDigest(env, { tg, getChannels, getSetting, makeDeepLink });
