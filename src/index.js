@@ -478,6 +478,16 @@ async function ensureLink(env, c) {
   return link;
 }
 
+async function getMissingChannels(env, userId) {
+  const chans = await getChannels(env, "forcesub");
+  const missing = [];
+  for (const c of chans) {
+    const ok = await isMember(env, c.chat_id, userId);
+    if (!ok) missing.push(c);
+  }
+  return missing;
+}
+
 // Checks if user has verified within the last 6 hours (when 6-Hour Pass is ON)
 async function isVerifiedLast6Hours(env, userId, fileId) {
   if (await hasActiveSub(env, userId)) return true;
