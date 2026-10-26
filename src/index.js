@@ -561,41 +561,6 @@ async function deliverBatch(env, chatId, userId, batch, justVerified) {
   await sendBatchMenuToUser(env, chatId, batch);
 }
 
-// 1. Verify FIRST (valid for 6 hours) -> 2. Check ForceSub SECOND -> 3. Open Episode/Quality Menu
-async function deliverBatch(env, chatId, userId, batch, justVerified) {
-  if (justVerified) {
-    // Save 6-hour verification pass for this user!
-    await setSetting(env, `vpass_${userId}`, String(Date.now() + 6 * 3600 * 1000));
-  }
-
-  // STEP 1: Check 6-Hour Verification Pass FIRST
-  if (!justVerified && (await shortlinkReady(env)) && !(await isVerifiedLast6Hours(env, userId))) {
-    await sendVerifyLink(env, chatId, userId, -batch.batch_id, `${batch.title} (${batch.quality})`);
-    return;
-  }
-
-  // STEP 2: After Verification, check ForceSub Channel(s)
-  const missing = await getMissingChannels(env, userId);
-  if (missing.length) {
-    const buttons = [];
-    for (const c of missing) {
-      const link = await ensureLink(env, c);
-      if (link) buttons.push([{ text: `📢 Join ${c.title}`.slice(0, 60), url: link }]);
-    }
-    buttons.push([{ text: "🔄 Try Again / Get Files", callback_data: `chkb:${batch.batch_id}` }]);
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: "✅ <b>Verification Active (6 Hours)!</b>\n\n🔐 Now join our backup channel(s) below and tap <b>Try Again / Get Files</b> to unlock all files:",
-      parse_mode: "HTML",
-      reply_markup: { inline_keyboard: buttons },
-    });
-    return;
-  }
-
-  // STEP 3: Open File/Episode Picker Immediately
-  await sendBatchMenuToUser(env, chatId, batch);
-}
-
 // ---------- Menus ----------
 const MAIN_MENU = {
   text: "⚙️ <b>Settings</b>\n\nSelect what you want to configure:",
