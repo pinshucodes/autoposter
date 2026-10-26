@@ -400,45 +400,42 @@ async function shortenUrl(env, longUrl) {
 async function sendVerifyLink(env, chatId, userId, targetId, displayTitle) {
   const token = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
   await env.DB.prepare("DELETE FROM tokens WHERE created < ?").bind(Date.now() - 24 * 3600 * 1000).run();
-  await env.DB.prepare("INSERT INTO tokens (token, user_id, file_row_id, created) VALUES (?, ?, ?, ?)")
-    .bind(token, String(userId), targetId, Date.now()).run();
+  await env.DB.prepare(
+    "INSERT INTO tokens (token, user_id, file_row_id, created) VALUES (?, ?, ?, ?)"
+  ).bind(token, String(userId), targetId, Date.now()).run();
 
   const tutorialUrl = await getSetting(env, "tutorial_url");
-  const keyboard = [];
+  const vpassOn = (await getSetting(env, "vpass_enabled")) !== "0";
 
-  if (APP_ORIGIN) {
-    // WebApp button: impossible to long-press & copy URL in Telegram!
-    keyboard.push([{ text: "🛡️ Verify Now & Unlock File", web_app: { url: `${APP_ORIGIN}/verify?t=${token}` } }]);
+  const username = await getBotUsername(env);
+  const short = await shortenUrl(env, `https://t.me/${username}?start=v_${token}`);
+
+  const keyboard = [];
+  if (short) {
+    keyboard.push([{ text: "🔓 Click Here to Verify (Open Browser)", url: short }]);
   } else {
-    const username = await getBotUsername(env);
-    const short = await shortenUrl(env, `https://t.me/${username}?start=v${token}`);
-    if (!short) {
-      await alertOwner(env, "shortlink", "Shortlink failed. Sending without verification.");
-      if (targetId < 0) {
-        const b = await getBatchRow(env, -targetId);
-        if (b) await sendBatchMenuToUser(env, chatId, b);
-      } else {
-        const row = await getFileRow(env, targetId);
-        if (row) await sendFileToUser(env, chatId, row);
-      }
-      return;
-    }
-    keyboard.push([{ text: "🛡️ Verify Now & Unlock File", url: short }]);
+    // Fallback if shortener is not set up
+    const dest = `https://t.me/${username}?start=v_${token}`;
+    keyboard.push([{ text: "🔓 Click Here to Verify", url: dest }]);
   }
 
   if (tutorialUrl) {
-    keyboard.push([{ text: "🎬 How to Verify (Tutorial)", url: tutorialUrl }]);
+    keyboard.push([{ text: "🎬 How to Verify (Tutorial Video)", url: tutorialUrl }]);
   }
+
+  const modeNote = vpassOn
+    ? "⏱️ <b>1 Verification unlocks ALL movies & series for 6 Hours!</b>"
+    : "🔓 <b>Complete 1 quick verification to unlock this file!</b>";
 
   await tg(env, "sendMessage", {
     chat_id: chatId,
     text:
-      `🛡️ <b>Secure Verification Required</b>\n\n` +
-      `🎬 <b>${esc(displayTitle)}</b>\n\n` +
-      `Complete the quick verification below to unlock your selected content.\n` +
-      `<i>🔒 Protected link — copying or external bypass tools are blocked.</i>`,
+      `🔐 <b>Verification Required</b>\n\n` +
+      `🎬 <b>${esc(displayTitle || "Media File")}</b>\n\n` +
+      `${modeNote}\n` +
+      `1️⃣ Tap <b>Click Here to Verify</b> below to open your browser.\n` +
+      `2️⃣ Complete the shortlink ad — it will automatically bring you back here and deliver your file!`,
     parse_mode: "HTML",
-    protect_content: true, // Locks the verification message from forwarding/copying
     reply_markup: { inline_keyboard: keyboard },
   });
 }
