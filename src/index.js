@@ -793,64 +793,46 @@ async function buildMetaMenu(env, note) {
 }
 // ---------- Shortlink & Tutorial settings menu ----------
 async function buildShortlinkMenu(env, note) {
+  const on = (await getSetting(env, "shortlink_enabled")) === "1";
   const domain = await getSetting(env, "shortlink_domain");
   const key = await getSetting(env, "shortlink_key");
-  const on = (await getSetting(env, "shortlink_enabled")) === "1";
   const tut = await getSetting(env, "tutorial_url");
+  const vpassOn = (await getSetting(env, "vpass_enabled")) !== "0";
 
-  let text = "🔗 <b>Shortlink & Tutorial Settings</b>\n\n" +
+  let text =
+    "🔗 <b>Shortlink & Tutorial Settings</b>\n" +
     "Users pass a copy-protected shortlink before they get a file or season batch.\n\n";
   text += `Status: ${on ? "✅ ON (Anti-Copy Mini App Shield Active)" : "❌ OFF"}\n`;
+  text += `⏱️ 6-Hour Verify Pass: ${vpassOn ? "🟢 <b>ON (Verify once for all movies)</b>" : "🔴 <b>OFF (Verify every movie)</b>"}\n`;
   text += `Domain: ${domain ? esc(domain) : "<i>not set</i>"}\n`;
-  text += `API key: ${key ? "<code>" + esc(key.slice(0, 4)) + "••••</code>" : "<i>not set</i>"}\n`;
+  text += `API Key: ${key ? "<code>" + esc(key.slice(0, 6)) + "••••••</code>" : "<i>not set</i>"}\n`;
   text += `How to Verify Tutorial: ${tut ? esc(tut) : "<i>not set</i>"}`;
   if (note) text += `\n\n${note}`;
 
   const buttons = [
     [{ text: on ? "🔴 Turn OFF" : "🟢 Turn ON", callback_data: "sl:toggle" }],
-    [{ text: "🌐 Set Domain", callback_data: "sl:domain" }, { text: "🔑 Set API Key", callback_data: "sl:key" }],
-    [{ text: "🎬 Set Tutorial Link (How to Verify)", callback_data: "sl:tutorial" }],
-  ];
-  if (tut) buttons.push([{ text: "🗑 Remove Tutorial Link", callback_data: "sl:rmtut" }]);
-  buttons.push(...BACK_BUTTON);
-  return { text, buttons };
-}
-
-async function showShortlinkMenu(env, chatId, messageId) {
-  const host = (await getSetting(env, "shortlink_host")) || "Not set";
-  const key = await getSetting(env, "shortlink_key");
-  const tut = (await getSetting(env, "tutorial_url")) || "Not set";
-  const samp = (await getSetting(env, "sample_url")) || "Auto (from uploaded sample file)";
-  const vpassOn = (await getSetting(env, "vpass_enabled")) !== "0";
-
-  const maskedKey = key ? key.slice(0, 4) + "••••" + key.slice(-4) : "Not set";
-  const ready = host !== "Not set" && Boolean(key);
-
-  const text =
-    `🔗 <b>Shortlink & Tutorial Settings</b>\n\n` +
-    `Status: ${ready ? "🟢 <b>Enabled</b>" : "🔴 <b>Disabled</b>"}\n` +
-    `⏱️ <b>6-Hour Verify Pass:</b> ${vpassOn ? "🟢 <b>ON (Verify once for all movies)</b>" : "🔴 <b>OFF (Verify every movie)</b>"}\n` +
-    `🌐 <b>Provider Host:</b> <code>${esc(host)}</code>\n` +
-    `🔑 <b>API Key:</b> <code>${esc(maskedKey)}</code>\n` +
-    `🎬 <b>How-to-Verify Video:</b> ${esc(tut)}\n` +
-    `🎞️ <b>Sample Channel Link:</b> ${esc(samp)}\n\n` +
-    `<i>When 6-Hour Pass is ON, users verify once per 6 hours to download any movie or series.</i>`;
-
-  const buttons = [
     [{
       text: vpassOn ? "⏱️ 6-Hour Pass: 🟢 ON (Tap to Turn OFF)" : "⏱️ 6-Hour Pass: 🔴 OFF (Tap to Turn ON)",
       callback_data: "sl:toggle_vpass",
     }],
-    [{ text: "🌐 Set Provider (e.g. shortxlinks.com)", callback_data: "sl:host" }],
-    [{ text: "🔑 Set API Key", callback_data: "sl:key" }],
-    [{ text: "🎬 Set Tutorial Link", callback_data: "sl:tut" }],
-    [{ text: "🎞️ Set Sample Channel Link", callback_data: "sl:sample" }],
+    [{ text: "🌐 Set Domain", callback_data: "sl:domain" }, { text: "🔑 Set API Key", callback_data: "sl:key" }],
+    [{ text: "🎬 Set Tutorial Link (How to Verify)", callback_data: "sl:tutorial" }],
   ];
-  if (ready || tut !== "Not set" || samp !== "Auto (from uploaded sample file)") {
-    buttons.push([{ text: "🗑️ Disable & Clear Shortlink", callback_data: "sl:clear" }]);
-  }
+  if (tut) buttons.push([{ text: "🗑️ Remove Tutorial Link", callback_data: "sl:rmtut" }]);
   buttons.push(...BACK_BUTTON);
-  await editMenu(env, chatId, messageId, text, buttons);
+  return { text, buttons };
+}
+
+async function showShortlinkMenu(env, chatId, messageId, note) {
+  const menu = await buildShortlinkMenu(env, note);
+  await tg(env, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: menu.text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: menu.buttons },
+  });
 }
 // Owner typed a new setting value
 async function handleSettingInput(env, msg, field) {
