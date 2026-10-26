@@ -2898,14 +2898,13 @@ async function handleChannelPost(post, env) {
   const rawTargets = (await getChannels(env, "lectures")).slice(0, 50);
   const { isTestMode, targets } = await resolveTargetChannels(env, rawTargets, getSetting);
   if (!targets.length) return;
-  if (isTestMode) parsed.groupKey = `test_${parsed.groupKey}`;
   await ensureExtraTables(env);
   const fullText = `${info.name || ""} ${post.caption || ""}`;
   const isSample = /\bsample\b/i.test(fullText);
   const parsed = parseMediaFilename(info.name, post.caption || "");
+  if (isTestMode) parsed.groupKey = `test_${parsed.groupKey}`;
   const groupOn = (await getSetting(env, "group_qualities")) !== "0";
   const showMediaInfo = (await getSetting(env, "mediainfo_enabled")) !== "0";
-
   const existingPost = groupOn
     ? await env.DB.prepare("SELECT * FROM media_posts WHERE group_key = ?").bind(parsed.groupKey).first()
     : null;
