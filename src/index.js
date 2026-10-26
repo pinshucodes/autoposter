@@ -152,15 +152,16 @@ async function handleMessage(msg, env) {
     return;
   }
 
-  if (text.startsWith("/digest")) {
+    if (text.startsWith("/digest")) {
     await clearState(env, userId);
-    const res = await sendDailyDigest(env, { tg, getChannels, getSetting, makeDeepLink });
+    const res = await sendDailyDigest(env, { tg, getChannels, getSetting, setSetting, makeDeepLink });
     await tg(env, "sendMessage", {
       chat_id: chatId,
-      text: res.ok ? `✅ Daily Digest posted to ${res.sentCount} ForceSub channel(s) (${res.totalUploads} titles).` : `⚠️ Could not post digest: ${res.reason}`,
+      text: res.ok ? `✅ Daily Digest posted to ${res.sentCount} channel(s) (${res.totalUploads} titles).` : `⚠️ Could not post digest: ${res.reason}`,
     });
     return;
   }
+
 
   if (text.startsWith("/stats")) {
     await clearState(env, userId);
