@@ -478,16 +478,6 @@ async function ensureLink(env, c) {
   return link;
 }
 
-async function getMissingChannels(env, userId) {
-  const chans = await getChannels(env, "forcesub");
-  const missing = [];
-  for (const c of chans) {
-    const ok = await isMember(env, c.chat_id, userId);
-    if (!ok) missing.push(c);
-  }
-  return missing;
-}
-
 // Checks if user has verified within the last 6 hours (when 6-Hour Pass is ON)
 async function isVerifiedLast6Hours(env, userId, fileId) {
   if (await hasActiveSub(env, userId)) return true;
@@ -496,7 +486,7 @@ async function isVerifiedLast6Hours(env, userId, fileId) {
   if (passEnabled) {
     const r = await env.DB.prepare("SELECT value FROM settings WHERE key = ?")
       .bind(`vpass_${userId}`).first();
-    return r && Number(r.value) > Date.now();
+    return Boolean(r && Number(r.value) > Date.now());
   }
 
   // If 6-Hour Pass is turned OFF, check standard per-file verification
@@ -533,8 +523,28 @@ async function deliverFile(env, chatId, userId, row, justVerified) {
     return;
   }
 
-  // STEP 3: Send File Immediately
-  await sendFileToUser(env, chatId, row);
+  // STEP 3: Send File Immediately (Self-contained!)
+  const delMins = Number((await getSetting(env, "delete_mins")) || 0);
+  const prot = (await getSetting(env, "protect_files")) === "1";
+  const warn = delMins > 0
+    ? `\n\n⏳ <i>Note: This file will auto-delete in ${delMins} minutes. Forward/save it now!</i>`
+    : "";
+  const cap = `🎬 <b>${esc(row.title)}</b>\n📦 <b>Size:</b> ${formatSize(row.size || 0)}${warn}`;
+
+  const method =
+    row.send_as === "video" ? "sendVideo" :
+    row.send_as === "audio" ? "sendAudio" : "sendDocument";
+  const payload = {
+    chat_id: chatId,
+    [row.send_as || "document"]: row.file_id,
+    caption: cap,
+    parse_mode: "HTML",
+    protect_content: prot,
+  };
+  const sent = await tg(env, method, payload);
+  if (sent.ok && delMins > 0) {
+    await scheduleDelete(env, chatId, sent.result.message_id, delMins);
+  }
 }
 
 // 1. Verify FIRST -> 2. Check ForceSub SECOND -> 3. Open Episode/Quality Menu
@@ -567,8 +577,41 @@ async function deliverBatch(env, chatId, userId, batch, justVerified) {
     return;
   }
 
-  // STEP 3: Open File/Episode Picker Immediately
-  await sendBatchMenuToUser(env, chatId, batch);
+  // STEP 3: Open File/Episode Picker Immediately (Self-contained!)
+  let items = [];
+  try { items = JSON.parse(batch.items_json || "[]"); } catch (e) { items = []; }
+  if (!items.length) {
+    await tg(env, "sendMessage", { chat_id: chatId, text: "⚠️ No files found in this batch." });
+    return;
+  }
+
+  // If only 1 file in the batch, send it directly!
+  if (items.length === 1) {
+    const fRow = await env.DB.prepare("SELECT * FROM files WHERE id = ?").bind(items[0].rowId).first();
+    if (fRow) {
+      await deliverFile(env, chatId, userId, fRow, true);
+      return;
+    }
+  }
+
+  const buttons = [];
+  for (const it of items.slice(0, 45)) {
+    const epTag = it.episode ? `E${String(it.episode).padStart(2, "0")} • ` : "";
+    const qTag = it.quality ? `${it.quality} • ` : "";
+    const sTag = it.size ? formatSize(it.size) : "";
+    const label = `📥 ${epTag}${qTag}${sTag}`.replace(/ • $/, "");
+    buttons.push([{ text: label, callback_data: `getf:${it.rowId}` }]);
+  }
+  if (items.length > 1) {
+    buttons.unshift([{ text: `📦 Send All (${items.length} Files)`, callback_data: `getall:${batch.batch_id}` }]);
+  }
+
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `🎬 <b>${esc(batch.title)}</b>\n\n👇 <b>Select a file quality/episode below to receive it instantly:</b>`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons },
+  });
 }
 
 // ---------- Menus ----------
