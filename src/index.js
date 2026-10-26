@@ -2875,11 +2875,16 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
   }
 
   // 2. Download Button
-  if (batchId) {
-    const dlLink = await makeDeepLink(env, `b${batchId}`);
-    const countLabel = items.length > 1 ? ` (${items.length} Files)` : "";
-    buttons.push([{ text: `📥 Download Now${countLabel}`, url: dlLink }]);
-  }
+    if (batchId) {
+      const dLink = await makeDeepLink(env, `b${batchId}`);
+      const countLabel = items.length > 1 ? ` (${items.length} Files)` : "";
+      
+      // Automatically shorten the deep link into your shortxlinks.in URL!
+      const shortDl = await shortenUrl(env, dLink);
+      const finalDl = shortDl || dLink;
+
+      buttons.push([{ text: `📥 Download Now${countLabel}`, url: finalDl }]);
+    }
 
   // 3. How to Download Button (from your tutorial_url setting)
   const tutorialUrl = await getSetting(env, "tutorial_url");
