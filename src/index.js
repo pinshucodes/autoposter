@@ -489,8 +489,8 @@ async function isVerifiedLast6Hours(env, userId, fileId) {
     return Boolean(r && Number(r.value) > Date.now());
   }
 
-  // If 6-Hour Pass is turned OFF, check standard per-file verification
-  return await isVerifiedToday(env, userId, fileId);
+  // If 6-Hour Pass is turned OFF, require verification for every movie/series
+  return false;
 }
 
 // 1. Verify FIRST -> 2. Check ForceSub SECOND -> 3. Send File
