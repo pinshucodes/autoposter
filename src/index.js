@@ -816,17 +816,42 @@ async function buildShortlinkMenu(env, note) {
   return { text, buttons };
 }
 
-async function showShortlinkMenu(env, chatId, messageId, note) {
-  const menu = await buildShortlinkMenu(env, note);
-  await tg(env, "editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text: menu.text,
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: menu.buttons },
-  });
-}
+async function showShortlinkMenu(env, chatId, messageId) {
+  const host = (await getSetting(env, "shortlink_host")) || "Not set";
+  const key = await getSetting(env, "shortlink_key");
+  const tut = (await getSetting(env, "tutorial_url")) || "Not set";
+  const samp = (await getSetting(env, "sample_url")) || "Auto (from uploaded sample file)";
+  const vpassOn = (await getSetting(env, "vpass_enabled")) !== "0";
 
+  const maskedKey = key ? key.slice(0, 4) + "••••" + key.slice(-4) : "Not set";
+  const ready = host !== "Not set" && Boolean(key);
+
+  const text =
+    `🔗 <b>Shortlink & Tutorial Settings</b>\n\n` +
+    `Status: ${ready ? "🟢 <b>Enabled</b>" : "🔴 <b>Disabled</b>"}\n` +
+    `⏱️ <b>6-Hour Verify Pass:</b> ${vpassOn ? "🟢 <b>ON (Verify once for all movies)</b>" : "🔴 <b>OFF (Verify every movie)</b>"}\n` +
+    `🌐 <b>Provider Host:</b> <code>${esc(host)}</code>\n` +
+    `🔑 <b>API Key:</b> <code>${esc(maskedKey)}</code>\n` +
+    `🎬 <b>How-to-Verify Video:</b> ${esc(tut)}\n` +
+    `🎞️ <b>Sample Channel Link:</b> ${esc(samp)}\n\n` +
+    `<i>When 6-Hour Pass is ON, users verify once per 6 hours to download any movie or series.</i>`;
+
+  const buttons = [
+    [{
+      text: vpassOn ? "⏱️ 6-Hour Pass: 🟢 ON (Tap to Turn OFF)" : "⏱️ 6-Hour Pass: 🔴 OFF (Tap to Turn ON)",
+      callback_data: "sl:toggle_vpass",
+    }],
+    [{ text: "🌐 Set Provider (e.g. shortxlinks.com)", callback_data: "sl:host" }],
+    [{ text: "🔑 Set API Key", callback_data: "sl:key" }],
+    [{ text: "🎬 Set Tutorial Link", callback_data: "sl:tut" }],
+    [{ text: "🎞️ Set Sample Channel Link", callback_data: "sl:sample" }],
+  ];
+  if (ready || tut !== "Not set" || samp !== "Auto (from uploaded sample file)") {
+    buttons.push([{ text: "🗑️ Disable & Clear Shortlink", callback_data: "sl:clear" }]);
+  }
+  buttons.push(...BACK_BUTTON);
+  await editMenu(env, chatId, messageId, text, buttons);
+}
 // Owner typed a new setting value
 async function handleSettingInput(env, msg, field) {
   const chatId = msg.chat.id;
