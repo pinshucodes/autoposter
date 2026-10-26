@@ -2578,9 +2578,9 @@ async function handleButton(query, env) {
       const fieldMap = { domain: "shortlink_domain", key: "shortlink_key", tutorial: "tutorial_url" };
       await setState(env, userId, `set:${fieldMap[sub]}`);
       const prompts = {
-        domain: "🌐 Send your shortlink domain (for example: <code>gplinks.in</code> or <code>shrinkme.io</code>).",
+        domain: "🌐 Send your shortlink domain (for example: <code>gplinks.in</code> or <code>shrinkme.io</code>):",
         key: "🔑 Send your shortlink API key. I'll delete your message right after saving it.",
-        tutorial: "🎬 Send the link to your <b>How to Verify</b> tutorial video/post (for example: <code>https://t.me/yourchannel/123</code>).",
+        tutorial: "🎬 Send the link to your <b>How to Verify</b> tutorial video/post (for example: <code>https://t.me/yourchannel/10</code>):",
       };
       await tg(env, "editMessageText", {
         chat_id: chatId,
@@ -2592,9 +2592,14 @@ async function handleButton(query, env) {
       return;
     }
     let note = "";
+    if (sub === "toggle_vpass") {
+      const cur = (await getSetting(env, "vpass_enabled")) !== "0";
+      await setSetting(env, "vpass_enabled", cur ? "0" : "1");
+      note = cur ? "🔴 6-Hour Pass turned OFF (Verify every movie)." : "🟢 6-Hour Pass turned ON (Verify once per 6 hours).";
+    }
     if (sub === "rmtut") {
       await env.DB.prepare("DELETE FROM settings WHERE key = 'tutorial_url'").run();
-      note = "🗑 Tutorial link removed.";
+      note = "🗑️ Tutorial link removed.";
     }
     if (sub === "toggle") {
       const on = (await getSetting(env, "shortlink_enabled")) === "1";
