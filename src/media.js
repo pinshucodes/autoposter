@@ -1,6 +1,7 @@
+// src/media.js - Filename Parser, TMDb/OMDb & Channel Auto-Poster
 import {
   tg, esc, ensureExtraTables, getChannels, getSetting, saveFile,
-  formatSize, makeDeepLink
+  formatSize, makeDeepLink, shortenUrl
 } from "./core.js";
 import { resolveTargetChannels } from "./testmode.js";
 
@@ -168,7 +169,8 @@ async function fetchMediaMeta(env, info) {
         if (dateStr) out.year = dateStr.slice(0, 4);
         if (hit.vote_average) out.rating = `${Number(hit.vote_average).toFixed(1)}/10`;
         if (hit.overview) out.plot = hit.overview.slice(0, 240) + (hit.overview.length > 240 ? "..." : "");
-        if (hit.backdrop_path || hit.poster_path) {
+        // PRIORITIZE PORTRAIT POSTER PATH FIRST INSTEAD OF LANDSCAPE BACKDROP
+        if (hit.poster_path || hit.backdrop_path) {
           out.poster = `https://image.tmdb.org/t/p/w780${hit.poster_path || hit.backdrop_path}`;
         }
       }
@@ -236,7 +238,7 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
 
   if (meta && meta.plot) lines.push(`\n📝 <i>${esc(meta.plot)}</i>`);
 
-  lines.push("", `⬇️ <b>Tap below to view all files & download:</b>`);
+  lines.push("", `⬇️ <b>Tap below to download directly in browser:</b>`);
 
   const buttons = [];
   const sampleChannelUrl = await getSetting(env, "sample_url");
@@ -250,7 +252,12 @@ async function buildChannelPostView(env, meta, info, items, showMediaInfo, sampl
   if (batchId) {
     const dLink = await makeDeepLink(env, `b${batchId}`);
     const countLabel = items.length > 1 ? ` (${items.length} Files)` : "";
-    buttons.push([{ text: `📥 Download Now${countLabel}`, url: dLink }]);
+    
+    // AUTOMATICALLY SHORTEN SO CLICKING OPENS DIRECTLY IN BROWSER
+    const shortDl = await shortenUrl(env, dLink);
+    const finalDl = shortDl || dLink;
+
+    buttons.push([{ text: `📥 Download Now${countLabel}`, url: finalDl }]);
   }
 
   const tutorialUrl = await getSetting(env, "tutorial_url");
@@ -315,9 +322,9 @@ export async function handleChannelPost(post, env) {
     const markup = { inline_keyboard: [[{ text: "📥 Download PDF", url: link }]] };
 
     if (cover) {
-      await tg(env, "sendPhoto", { chat_id: targetChat, photo: cover, caption, parse_mode: "HTML", reply_markup: markup });
+      await tg(env, "sendPhoto", { chat_id: targetChat, photo: cover, caption, parse_mode: "HTML", reply_markup: markup, protect_content: true });
     } else {
-      await tg(env, "sendMessage", { chat_id: targetChat, text: caption, parse_mode: "HTML", reply_markup: markup });
+      await tg(env, "sendMessage", { chat_id: targetChat, text: caption, parse_mode: "HTML", reply_markup: markup, protect_content: true });
     }
     return;
   }
@@ -423,9 +430,10 @@ export async function handleChannelPost(post, env) {
 
     let sent = null, hasPhoto = 0;
     if (photoSource) {
+      // PROTECT CONTENT LOCKED (Turn off copy / forward feature)
       sent = await tg(env, "sendPhoto", {
         chat_id: targetChat, photo: photoSource, caption: view.caption,
-        parse_mode: "HTML", reply_markup: { inline_keyboard: view.buttons },
+        parse_mode: "HTML", reply_markup: { inline_keyboard: view.buttons }, protect_content: true,
       });
       if (sent.ok) {
         hasPhoto = 1;
@@ -436,9 +444,10 @@ export async function handleChannelPost(post, env) {
     }
 
     if (!sent || !sent.ok) {
+      // PROTECT CONTENT LOCKED (Turn off copy / forward feature)
       sent = await tg(env, "sendMessage", {
         chat_id: targetChat, text: view.caption,
-        parse_mode: "HTML", reply_markup: { inline_keyboard: view.buttons },
+        parse_mode: "HTML", reply_markup: { inline_keyboard: view.buttons }, protect_content: true,
       });
     }
 
