@@ -261,12 +261,24 @@ export async function shortenUrl(env, longUrl) {
     const api = `https://${domain}/api?api=${encodeURIComponent(key)}&url=${encodeURIComponent(longUrl)}`;
     const res = await fetch(api);
     const data = await res.json();
-    if (data.status === "success" && data.shortenedUrl) return data.shortenedUrl;
+    
+    // Debug log (you can view this in your Cloudflare Worker logs if it ever fails again)
+    console.log("Shortlink API response:", JSON.stringify(data));
+
+    // Check multiple common response fields used by different shortlink providers
+    const shortUrl = data.shortenedUrl || data.shortened_url || data.shorturl || data.url;
+    const isSuccess = data.status === "success" || data.status === 1 || data.success === true || data.status === "ok";
+
+    // If a short URL was returned and status is successful (or the API doesn't use a status field)
+    if (shortUrl && (isSuccess || !data.status)) {
+      return shortUrl;
+    }
   } catch (err) {
     console.log("Shortlink error:", err);
   }
   return null;
 }
+
 
 export async function isVerifiedLast6Hours(env, userId) {
   if (await hasActiveSub(env, userId)) return true;
