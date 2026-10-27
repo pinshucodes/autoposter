@@ -253,7 +253,7 @@ export async function shortlinkReady(env) {
   return on === "1" && !!domain && !!key;
 }
 
-async function shortenUrl(env, longUrl) {
+export async function shortenUrl(env, longUrl) {
   const domain = await getSetting(env, "shortlink_domain");
   const key = await getSetting(env, "shortlink_key");
   if (!domain || !key) return null;
@@ -301,8 +301,6 @@ async function shortenUrl(env, longUrl) {
   }
   return null;
 }
-
-
 
 export async function isVerifiedLast6Hours(env, userId) {
   if (await hasActiveSub(env, userId)) return true;
