@@ -160,9 +160,11 @@ async function fetchMediaMeta(env, info) {
       const endpoint = info.isSeries ? "tv" : "movie";
       const yParam = info.year ? (info.isSeries ? `&first_air_date_year=${info.year}` : `&year=${info.year}`) : "";
       const url = `https://api.themoviedb.org/3/search/${endpoint}?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(info.cleanTitle)}${yParam}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      const hit = data.results && data.results[0];
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const rawText = (await res.text()).trim();
+      let data = null;
+      try { data = JSON.parse(rawText); } catch (_) {}
+      const hit = data && data.results && data.results[0];
       if (hit) {
         out.title = hit.title || hit.name || out.title;
         const dateStr = hit.release_date || hit.first_air_date || "";
@@ -175,7 +177,7 @@ async function fetchMediaMeta(env, info) {
         }
       }
     } catch (err) {
-      console.log("TMDb lookup error:", err);
+      console.log("TMDb lookup error:", err.message || String(err));
     }
   }
 
@@ -184,8 +186,10 @@ async function fetchMediaMeta(env, info) {
       const oType = info.isSeries ? "series" : "movie";
       const yParam = info.year ? `&y=${info.year}` : "";
       const url = `https://www.omdbapi.com/?apikey=${encodeURIComponent(omdbKey)}&t=${encodeURIComponent(info.cleanTitle)}&type=${oType}${yParam}`;
-      const res = await fetch(url);
-      const data = await res.json();
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const rawText = (await res.text()).trim();
+      let data = null;
+      try { data = JSON.parse(rawText); } catch (_) {}
       if (data && data.Response === "True") {
         out.title = data.Title || out.title;
         if (data.Year && !out.year) out.year = data.Year.slice(0, 4);
@@ -195,7 +199,7 @@ async function fetchMediaMeta(env, info) {
         if (!out.poster && data.Poster && data.Poster.startsWith("http")) out.poster = data.Poster;
       }
     } catch (err) {
-      console.log("OMDb lookup error:", err);
+      console.log("OMDb lookup error:", err.message || String(err));
     }
   }
 
