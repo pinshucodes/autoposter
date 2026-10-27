@@ -253,31 +253,55 @@ export async function shortlinkReady(env) {
   return on === "1" && !!domain && !!key;
 }
 
-export async function shortenUrl(env, longUrl) {
+async function shortenUrl(env, longUrl) {
   const domain = await getSetting(env, "shortlink_domain");
   const key = await getSetting(env, "shortlink_key");
   if (!domain || !key) return null;
+
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+  };
+
   try {
     const api = `https://${domain}/api?api=${encodeURIComponent(key)}&url=${encodeURIComponent(longUrl)}`;
-    const res = await fetch(api);
-    const data = await res.json();
-    
-    // Debug log (you can view this in your Cloudflare Worker logs if it ever fails again)
-    console.log("Shortlink API response:", JSON.stringify(data));
+    const res = await fetch(api, { method: "GET", headers });
+    const rawText = (await res.text()).trim();
 
-    // Check multiple common response fields used by different shortlink providers
-    const shortUrl = data.shortenedUrl || data.shortened_url || data.shorturl || data.url;
-    const isSuccess = data.status === "success" || data.status === 1 || data.success === true || data.status === "ok";
-
-    // If a short URL was returned and status is successful (or the API doesn't use a status field)
-    if (shortUrl && (isSuccess || !data.status)) {
-      return shortUrl;
+    // If the API returns a raw plain-text URL directly
+    if (/^https?:\/\/\S+$/i.test(rawText)) {
+      return rawText;
     }
+
+    let data = null;
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      console.log(`Shortlink non-JSON (${res.status}) from ${domain}:`, rawText.slice(0, 250));
+      return null;
+    }
+
+    const shortUrl =
+      data.shortenedUrl ||
+      data.shortened_url ||
+      data.shorturl ||
+      data.shortUrl ||
+      data.short_url ||
+      data.url ||
+      data.link ||
+      (data.data && (data.data.shortenedUrl || data.data.shortUrl || data.data.url));
+
+    if (shortUrl && typeof shortUrl === "string") {
+      return shortUrl.startsWith("http") ? shortUrl : `https://${domain}/${shortUrl.replace(/^\/+/, "")}`;
+    }
+
+    console.log("Shortlink JSON unrecognized:", rawText.slice(0, 250));
   } catch (err) {
-    console.log("Shortlink error:", err);
+    console.log("Shortlink fetch error:", err.message || String(err));
   }
   return null;
 }
+
 
 
 export async function isVerifiedLast6Hours(env, userId) {
