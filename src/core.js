@@ -74,8 +74,14 @@ export async function tg(env, method, data, retried = false) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
+      signal: AbortSignal.timeout(15000),
     });
-    json = await res.json();
+    const raw = (await res.text()).trim();
+    try {
+      json = JSON.parse(raw);
+    } catch (_) {
+      return { ok: false, error_code: res.status, description: `Non-JSON Telegram response: ${raw.slice(0, 120)}` };
+    }
   } catch (err) {
     return { ok: false, error_code: 0, description: String(err).split(env.BOT_TOKEN).join("***") };
   }
@@ -258,56 +264,210 @@ export async function shortenUrl(env, longUrl) {
   const key = await getSetting(env, "shortlink_key");
   if (!domain || !key) return null;
 
+  let cleanDomain = String(domain).trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  cleanDomain = cleanDomain.split("/")[0].split("?")[0].split("#")[0].trim();
+
+  let cleanKey = String(key).trim();
+  cleanKey = cleanKey.replace(/^["']+|["']+$/g, "").trim();
+  cleanKey = cleanKey.replace(/^api[=:]/i, "").trim();
+  cleanKey = cleanKey.replace(/^["']+|["']+$/g, "").trim();
+  if (!cleanDomain || !cleanKey) return null;
+
+  const isHttp = (/^http:\/\//i.test(String(domain).trim()) || cleanDomain.startsWith("127.0.0.1") || cleanDomain.startsWith("localhost")) && !String(domain).includes("linkmorph");
+  const proto = isHttp ? "http" : "https";
+
   const headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
   };
 
+  const parseShortUrl = (data) => {
+    if (!data || typeof data !== "object") return null;
+    const findStr = (obj) => {
+      if (!obj || typeof obj !== "object") return null;
+      return (
+        obj.shortenedUrl ||
+        obj.shortUrl ||
+        obj.short_url ||
+        obj.shortened_url ||
+        obj.shorturl ||
+        obj.url ||
+        obj.link ||
+        obj.short ||
+        obj.alias
+      );
+    };
+
+    let candidate = findStr(data);
+    if (!candidate && Array.isArray(data) && data[0]) {
+      candidate = findStr(data[0]);
+    }
+    if (!candidate && data.data && typeof data.data === "object") {
+      candidate = findStr(data.data);
+    }
+    if (!candidate && data.result && typeof data.result === "object") {
+      candidate = findStr(data.result);
+    }
+    if (!candidate && Array.isArray(data.links) && data.links[0]) {
+      candidate = findStr(data.links[0]);
+    }
+    if (!candidate && Array.isArray(data.results) && data.results[0]) {
+      candidate = findStr(data.results[0]);
+    }
+    if (!candidate && Array.isArray(data.data) && data.data[0]) {
+      candidate = findStr(data.data[0]);
+    }
+    if (!candidate && Array.isArray(data.result) && data.result[0]) {
+      candidate = findStr(data.result[0]);
+    }
+
+    if (candidate && typeof candidate === "string") {
+      let result = candidate.trim();
+      if (!result || result.toLowerCase() === "null" || result.toLowerCase() === "undefined" || result.toLowerCase() === "false") return null;
+      if (/^\/\//.test(result)) {
+        result = `${proto}:${result}`;
+      }
+      if (/^https?:\/\//i.test(result)) {
+        if (/^http:\/\//i.test(result) && (cleanDomain.includes("linkmorph") || result.includes("linkmorph"))) {
+          result = result.replace(/^http:\/\//i, "https://");
+        }
+        return result;
+      }
+      if (result.startsWith(cleanDomain)) {
+        return `${proto}://${result.replace(/^\/+/, "")}`;
+      }
+      return `${proto}://${cleanDomain}/${result.replace(/^\/+/, "")}`;
+    }
+    return null;
+  };
+
+  const parsePlainText = (text) => {
+    if (!text || typeof text !== "string") return null;
+    let t = text.trim();
+    if (!t || t.includes("<") || t.includes("\n") || t.includes(" ") || t.length > 256) {
+      return null;
+    }
+    const lower = t.toLowerCase();
+    if (lower === "null" || lower === "undefined" || lower === "error" || lower === "failed" || lower === "false" || lower === "0") {
+      return null;
+    }
+    if (/^\/\//.test(t)) return `${proto}:${t}`;
+    if (/^https?:\/\//i.test(t)) {
+      if (/^http:\/\//i.test(t) && (cleanDomain.includes("linkmorph") || t.includes("linkmorph"))) {
+        t = t.replace(/^http:\/\//i, "https://");
+      }
+      return t;
+    }
+    if (t.startsWith(cleanDomain)) return `${proto}://${t.replace(/^\/+/, "")}`;
+    if (/^[A-Za-z0-9_\-\/]+$/.test(t)) return `${proto}://${cleanDomain}/${t.replace(/^\/+/, "")}`;
+    return null;
+  };
+
+  // 1. LinkMorph native REST API (Endpoint 2: /api/v1/links/batch)
+  const isLinkMorph = cleanDomain.includes("linkmorph") || cleanKey.startsWith("lm_api_");
+  const lmHost = cleanDomain.includes("linkmorph") ? cleanDomain : "linkmorph.in";
+  if (isLinkMorph) {
+    try {
+      const lmRes = await fetch(`https://${lmHost}/api/v1/links/batch`, {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Authorization": `Bearer ${cleanKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ urls: [longUrl] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const rawText = (await lmRes.text()).trim();
+      if (lmRes.ok) {
+        const plain = parsePlainText(rawText);
+        if (plain) return plain;
+      }
+      try {
+        const data = JSON.parse(rawText);
+        const url = parseShortUrl(data);
+        if (url) return url;
+        if (data && (data.error || data.message || data.status === "error")) {
+          console.log(`LinkMorph error (${lmRes.status}):`, data.message || data.error);
+        }
+      } catch (_) {
+        console.log(`LinkMorph non-JSON (${lmRes.status}):`, rawText.slice(0, 250));
+      }
+    } catch (err) {
+      console.log("LinkMorph fetch error:", err.message || String(err));
+    }
+  }
+
+  // 2. Standard ShortX / GET endpoint: /api?api=...&url=...
   try {
-    const api = `https://${domain}/api?api=${encodeURIComponent(key)}&url=${encodeURIComponent(longUrl)}`;
-    const res = await fetch(api, { method: "GET", headers });
+    const api = `${proto}://${cleanDomain}/api?api=${encodeURIComponent(cleanKey)}&url=${encodeURIComponent(longUrl)}`;
+    const res = await fetch(api, { method: "GET", headers, signal: AbortSignal.timeout(8000) });
     const rawText = (await res.text()).trim();
 
-    // If the API returns a raw plain-text URL directly
-    if (/^https?:\/\/\S+$/i.test(rawText)) {
-      return rawText;
+    if (res.ok) {
+      const plain = parsePlainText(rawText);
+      if (plain) return plain;
     }
 
     let data = null;
     try {
       data = JSON.parse(rawText);
     } catch (_) {
-      console.log(`Shortlink non-JSON (${res.status}) from ${domain}:`, rawText.slice(0, 250));
-      return null;
+      console.log(`Shortlink non-JSON (${res.status}) from ${cleanDomain}:`, rawText.slice(0, 250));
     }
 
-    const shortUrl =
-      data.shortenedUrl ||
-      data.shortened_url ||
-      data.shorturl ||
-      data.shortUrl ||
-      data.short_url ||
-      data.url ||
-      data.link ||
-      (data.data && (data.data.shortenedUrl || data.data.shortUrl || data.data.url));
-
-    if (shortUrl && typeof shortUrl === "string") {
-      return shortUrl.startsWith("http") ? shortUrl : `https://${domain}/${shortUrl.replace(/^\/+/, "")}`;
+    if (data) {
+      const url = parseShortUrl(data);
+      if (url) return url;
+      if (data.status === "error" || data.error || data.message) {
+        console.log(`Shortlink error from ${cleanDomain}:`, data.message || data.error || data.status);
+      } else {
+        console.log("Shortlink JSON unrecognized:", rawText.slice(0, 250));
+      }
     }
-
-    console.log("Shortlink JSON unrecognized:", rawText.slice(0, 250));
   } catch (err) {
-    console.log("Shortlink fetch error:", err.message || String(err));
+    console.log("Shortlink GET fetch error:", err.message || String(err));
   }
+
+  // 3. Fallback: if not explicitly detected as LinkMorph by domain/key, try batch endpoint
+  if (!isLinkMorph) {
+    try {
+      const lmRes = await fetch(`${proto}://${cleanDomain}/api/v1/links/batch`, {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Authorization": `Bearer ${cleanKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ urls: [longUrl] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (lmRes.ok) {
+        const rawText = (await lmRes.text()).trim();
+        const plain = parsePlainText(rawText);
+        if (plain) return plain;
+        try {
+          const data = JSON.parse(rawText);
+          const url = parseShortUrl(data);
+          if (url) return url;
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
   return null;
 }
 
 export async function isVerifiedLast6Hours(env, userId) {
   if (await hasActiveSub(env, userId)) return true;
-  const passEnabled = (await getSetting(env, "vpass_enabled")) !== "0";
-  if (passEnabled) {
-    const r = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(`vpass_${userId}`).first();
-    return Boolean(r && Number(r.value) > Date.now());
+  const r = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(`vpass_${userId}`).first();
+  if (r && Number(r.value) > Date.now()) {
+    const passEnabled = (await getSetting(env, "vpass_enabled")) !== "0";
+    if (passEnabled) return true;
+    // Even if 6-hour pass is disabled globally, allow a 15-minute grace window
+    // so user can complete ForceSub checks or batch downloads without re-verifying
+    const remainingMs = Number(r.value) - Date.now();
+    if (remainingMs > (6 * 3600 - 900) * 1000) return true;
   }
   return false;
 }

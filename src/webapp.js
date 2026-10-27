@@ -48,16 +48,17 @@ export async function handleApi(request, env, path) {
   let body = {};
   try { body = await request.json(); } catch (err) {}
 
-  if (path === "/api/verify-link") {
+  if (path === "/api/verify-link" || path === "/api/verify") {
     const tok = String(body.token || "").trim();
     const t = await env.DB.prepare("SELECT token, user_id, file_row_id, created FROM tokens WHERE token = ?").bind(tok).first();
     if (!t || String(t.user_id) !== uid || Date.now() - t.created > 3600 * 1000) {
       return json({ error: "This verification session has expired. Please tap the button in the bot again." }, 400);
     }
-    await env.DB.prepare("UPDATE tokens SET created = ? WHERE token = ?").bind(Date.now(), tok).run();
     const username = await getBotUsername(env);
     const short = await shortenUrl(env, `https://t.me/${username}?start=v_${tok}`);
     if (!short) return json({ error: "Verification server is busy. Please try again." }, 500);
+    // Ensure verification token is NOT deleted or invalidated before shortener redirect succeeds
+    await env.DB.prepare("UPDATE tokens SET created = ? WHERE token = ?").bind(Date.now(), tok).run();
     return json({ url: short });
   }
 
@@ -191,7 +192,13 @@ if (!tg || !tg.initData) { titleEl.textContent = "🚫 Access Denied"; descEl.te
 else {
   fetch("/api/verify-link", { method: "POST", headers: { "Content-Type": "application/json", "X-Init-Data": tg.initData }, body: JSON.stringify({ token: token }) })
   .then(r => r.json()).then(d => {
-    if (d.error || !d.url) { titleEl.textContent = "⚠️ Session Expired"; descEl.textContent = d.error || "Tap the button in the bot again."; return; }
+    if (d.error || !d.url) {
+      titleEl.textContent = (d.error && d.error.includes("busy"))
+        ? "⚠️ Server Busy"
+        : ((d.error && d.error.includes("expired")) ? "⚠️ Session Expired" : "⚠️ Verification Error");
+      descEl.textContent = d.error || "Tap the button in the bot again.";
+      return;
+    }
     titleEl.textContent = "🛡️ Security Check Ready"; descEl.textContent = "Tap below and complete the short step to unlock your file.";
     btnEl.style.display = "block"; btnEl.onclick = function() { btnEl.disabled = true; tg.openLink(d.url, { try_instant_view: false }); setTimeout(() => tg.close(), 350); };
   }).catch(() => { errEl.textContent = "Network error. Please try again."; });

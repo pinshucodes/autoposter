@@ -6,8 +6,9 @@ import {
   setState, getState, clearState, getFileRow, getBatchRow, getBotUsername,
   makeDeepLink, isRateLimited, recordUser, activateSubscription, fmtDate,
   dayString, sendFileToUser, sendBatchMenuToUser, deliverFile, deliverBatch,
-  getMissingChannels, starsEnabled, formatDelay
+  getMissingChannels, starsEnabled, formatDelay, shortenUrl, isVerifiedLast6Hours
 } from "./core.js";
+export { shortenUrl } from "./core.js";
 import { handleChannelPost } from "./media.js";
 import {
   MAIN_MENU, showMainMenu, showRoleMenu, showCoverMenu, showDeleteMenu,
@@ -49,6 +50,12 @@ async function handleMessage(msg, env) {
       const t = await env.DB.prepare("SELECT file_row_id, user_id, created FROM tokens WHERE token = ?").bind(tok[1]).first();
       const fresh = t && Date.now() - t.created < 60 * 60 * 1000;
       if (!t || String(t.user_id) !== userId || !fresh) {
+        // If user already has an active 6-hour pass granted within the last 120 seconds,
+        // this is a duplicate /start request from double-tapping or concurrent redemption.
+        const activePass = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(`vpass_${userId}`).first();
+        if (activePass && Number(activePass.value) > Date.now() + (6 * 3600 - 120) * 1000) {
+          return;
+        }
         await tg(env, "sendMessage", { chat_id: chatId, text: "⚠️ This verification link is invalid or has expired. Please tap the button on the channel post again." });
         return;
       }
@@ -60,14 +67,18 @@ async function handleMessage(msg, env) {
       if (!used.meta.changes) return;
       await env.DB.prepare("INSERT INTO verifications (user_id, file_row_id, day) VALUES (?, ?, ?)").bind(userId, Math.abs(t.file_row_id), dayString(0)).run();
 
+      const justVerified = true;
+      // Immediately write 6-hour pass (vpass_${userId}) so user is never prompted again
+      await setSetting(env, `vpass_${userId}`, String(Date.now() + 6 * 3600 * 1000));
+
       if (t.file_row_id < 0) {
         const batch = await getBatchRow(env, -t.file_row_id);
         if (!batch) await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that season batch is no longer available." });
-        else await deliverBatch(env, chatId, msg.from.id, batch, true);
+        else await deliverBatch(env, chatId, msg.from.id, batch, justVerified);
       } else {
         const row = await getFileRow(env, t.file_row_id);
         if (!row) await tg(env, "sendMessage", { chat_id: chatId, text: "Sorry, that file is no longer available." });
-        else await deliverFile(env, chatId, msg.from.id, row, true);
+        else await deliverFile(env, chatId, msg.from.id, row, justVerified);
       }
       return;
     }
@@ -237,7 +248,7 @@ async function handleButton(query, env) {
   const parts = query.data.split(":");
   const action = parts[0];
 
-  if (action === "bep" || action === "ball" || action === "bpage") {
+  if (action === "bep" || action === "getf" || action === "dl") {
     if (userId !== String(env.OWNER_ID)) {
       const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
       if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
@@ -245,55 +256,79 @@ async function handleButton(query, env) {
         return;
       }
     }
-    if (action === "bpage") {
-      const batch = await getBatchRow(env, Number(parts[1]));
-      if (!batch) {
-        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Menu expired.", show_alert: true });
-        return;
-      }
-      await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
-      await sendBatchMenuToUser(env, chatId, batch, Number(parts[2]) || 0, messageId);
+    const row = await getFileRow(env, Number(parts[1]));
+    if (!row) {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "File no longer available.", show_alert: true });
       return;
     }
     if (action === "bep") {
-      const row = await getFileRow(env, Number(parts[1]));
-      if (!row) {
-        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "File no longer available.", show_alert: true });
-        return;
-      }
       await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Sending file..." });
       await sendFileToUser(env, chatId, row, false);
-      return;
+    } else {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+      await deliverFile(env, chatId, query.from.id, row, false);
     }
-    if (action === "ball") {
-      const batch = await getBatchRow(env, Number(parts[1]));
-      if (!batch) {
-        await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Batch no longer available.", show_alert: true });
+    return;
+  }
+
+  if (action === "ball" || action === "getall") {
+    if (userId !== String(env.OWNER_ID)) {
+      const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
+      if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
         return;
       }
-      let items = [];
-      try { items = JSON.parse(batch.items_json || "[]"); } catch (e) { items = []; }
-      items.sort((a, b) => (a.season || 1) - (b.season || 1) || (a.episode || 0) - (b.episode || 0));
-      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `Sending ${items.length} files...` });
-      for (const ep of items) {
-        const row = await getFileRow(env, ep.rowId);
-        if (row) await sendFileToUser(env, chatId, row, true);
-      }
-      const rawMins = await getSetting(env, "delete_minutes");
-      const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
-      if (mins) {
-        const notice = await tg(env, "sendMessage", {
-          chat_id: chatId,
-          text: `⏳ <b>Auto-Delete Notice:</b> All files above will be deleted in <b>${formatDelay(mins)}</b>. Forward or share them to your Saved Messages now!`,
-          parse_mode: "HTML",
-        });
-        if (notice.ok) {
-          await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
-            .bind(String(chatId), notice.result.message_id, Date.now() + mins * 60 * 1000).run();
-        }
-      }
+    }
+    const batch = await getBatchRow(env, Number(parts[1]));
+    if (!batch) {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Batch no longer available.", show_alert: true });
       return;
     }
+    if (action === "getall") {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+      await deliverBatch(env, chatId, query.from.id, batch, false);
+      return;
+    }
+    let items = [];
+    try { items = JSON.parse(batch.items_json || "[]"); } catch (e) { items = []; }
+    items.sort((a, b) => (a.season || 1) - (b.season || 1) || (a.episode || 0) - (b.episode || 0));
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `Sending ${items.length} files...` });
+    for (const ep of items) {
+      const row = await getFileRow(env, ep.rowId);
+      if (row) await sendFileToUser(env, chatId, row, true);
+    }
+    const rawMins = await getSetting(env, "delete_minutes");
+    const mins = rawMins === null ? 5 : parseInt(rawMins, 10);
+    if (mins) {
+      const notice = await tg(env, "sendMessage", {
+        chat_id: chatId,
+        text: `⏳ <b>Auto-Delete Notice:</b> All files above will be deleted in <b>${formatDelay(mins)}</b>. Forward or share them to your Saved Messages now!`,
+        parse_mode: "HTML",
+      });
+      if (notice.ok) {
+        await env.DB.prepare("INSERT INTO deletions (chat_id, message_id, delete_at) VALUES (?, ?, ?)")
+          .bind(String(chatId), notice.result.message_id, Date.now() + mins * 60 * 1000).run();
+      }
+    }
+    return;
+  }
+
+  if (action === "bpage") {
+    if (userId !== String(env.OWNER_ID)) {
+      const b = await env.DB.prepare("SELECT banned FROM users WHERE user_id = ?").bind(userId).first();
+      if ((b && b.banned) || (await isRateLimited(env, userId, chatId))) {
+        await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+        return;
+      }
+    }
+    const batch = await getBatchRow(env, Number(parts[1]));
+    if (!batch) {
+      await tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Menu expired.", show_alert: true });
+      return;
+    }
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+    await sendBatchMenuToUser(env, chatId, batch, Number(parts[2]) || 0, messageId);
+    return;
   }
 
   if (action === "chk" || action === "chkb") {
@@ -312,13 +347,24 @@ async function handleButton(query, env) {
     await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
     await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
 
+    const isVerified = await isVerifiedLast6Hours(env, query.from.id);
     if (action === "chkb") {
       const batch = await getBatchRow(env, Number(parts[1]));
-      if (batch) await deliverBatch(env, chatId, query.from.id, batch, false);
+      if (batch) await deliverBatch(env, chatId, query.from.id, batch, isVerified);
     } else {
       const row = await getFileRow(env, Number(parts[1]));
-      if (row) await deliverFile(env, chatId, query.from.id, row, false);
+      if (row) await deliverFile(env, chatId, query.from.id, row, isVerified);
     }
+    return;
+  }
+
+  // Admin / settings callbacks only
+  const ADMIN_ACTIONS = new Set([
+    "sl", "set", "ch", "role", "add", "rm", "pst", "pk", "cov", "del", "pay", "meta", "close", "back"
+  ]);
+
+  if (!ADMIN_ACTIONS.has(action)) {
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
     return;
   }
 
@@ -556,10 +602,10 @@ export default {
     const url = new URL(request.url);
     setAppOrigin(url.origin);
 
-    if (request.method === "GET" && url.pathname === "/verify") {
+    if (request.method === "GET" && url.pathname.replace(/\/+$/, "") === "/verify") {
       return new Response(VERIFY_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
     }
-    if (request.method === "GET" && url.pathname === "/app") {
+    if (request.method === "GET" && url.pathname.replace(/\/+$/, "") === "/app") {
       return new Response(APP_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
     }
     if (request.method === "GET" && url.pathname.startsWith("/get/")) {
@@ -569,7 +615,7 @@ export default {
       return Response.redirect(`https://t.me/${username}?start=${startParam}`, 302);
     }
     if (url.pathname.startsWith("/api/")) {
-      return handleApi(request, env, url.pathname);
+      return handleApi(request, env, url.pathname.replace(/\/+$/, ""));
     }
     if (request.method === "POST") {
       const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
